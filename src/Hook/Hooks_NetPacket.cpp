@@ -1171,7 +1171,8 @@ namespace Hooks_NetPacket_OnlineFix {
         // 没开播报时这里整体跳过，家庭共享 + lua 才会落到专用分支改替代 id。
         if (broadcast && !didBroadcastRewrite) {
             AppId_t trackedId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
-            if (trackedId != 0 && trackedId != kOnlineFixAppId && msg.games_played_size() > 0) {
+            const bool isFamilyShared = Hooks_Package::GetFamilySharedOwner(trackedId) > 1;
+            if (!isFamilyShared && trackedId != 0 && trackedId != kOnlineFixAppId && msg.games_played_size() > 0) {
                 std::string name = Hooks_Misc::GetGameNameByAppID(trackedId);
                 if (!name.empty()) {
                     auto* topGame = msg.mutable_games_played(msg.games_played_size() - 1);
@@ -1220,17 +1221,8 @@ namespace Hooks_NetPacket_OnlineFix {
                                 playedAppId, reported, lender, inLua);
 
             if (lender > 1 && inLua) {
-                // 共享游戏又写了 lua：改成替代 AppId 上报。服务器只要看到真实
-                // appid 就会按共享许可记账、占用出借方名额；换成别的 id 就认不出来。
-                // 这个 AppId 在服务器上不存在，所以既不会播报也不会记录时长。
-                game->set_game_id(kFamilySharedMaskAppId);
-                // 不填 game_extra_info：这个字段会被服务器拿去当播报的游戏名，
-                // 填上就等于告诉好友在玩什么，和「不播报」的目标相反。
-                game->clear_game_extra_info();
                 game->clear_owner_id();
                 patched = true;
-                LOG_NETPACKET_INFO("FamilySharing: appid {} -> {} (shared+lua, lender {})",
-                                   playedAppId, kFamilySharedMaskAppId, lender);
                 continue;
             }
 
