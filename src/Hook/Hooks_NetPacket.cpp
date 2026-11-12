@@ -543,47 +543,58 @@ namespace Hooks_NetPacket_ETicket {
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_FamilySharing {
 
-    // 家庭共享的进出方向一概不干预，交给 Steam 按原生规则处理。
-    // 曾经在这里抹掉出借方归属、清空运行列表、丢弃锁库与停玩通知，试图让
-    // 借用方不受共享名额限制。实测那套做法改不动服务器的账：服务器按自己
-    // 记录的许可与占用判定，客户端说什么它都不采信，一轮倒计时走完照样踢线，
-    // 反而因为上报数据和它的账对不上，把原本的软提醒升级成了断开会话。
-    // 现在只保留观测，不改任何内容：占用名额、到期收回都是共享本来的行为。
-
-    // 停玩通知里写着要停哪个 AppId、归属给谁、还剩多少秒，落盘便于排查。
-    void LogStopPlaying(const uint8* pBody, uint32 cbBody)
+    void HandleStopPlaying(const uint8* pBody, uint32 cbBody)
     {
         CMsgClientSharedLibraryStopPlaying msg;
-        if (!msg.ParseFromArray(pBody, cbBody)) {
-            LOG_NETPACKET_WARN("FamilySharing: StopPlaying body unparsable ({} bytes)", cbBody);
-            return;
+        if (msg.ParseFromArray(pBody, cbBody)) {
+            constexpr int maxLogged = 8;
+            std::string detail;
+            for (int i = 0; i < msg.stop_apps_size() && i < maxLogged; ++i) {
+                const auto& app = msg.stop_apps(i);
+                if (!detail.empty()) detail += ", ";
+                detail += std::format("app_id={} owner_id={}",
+                                      app.has_app_id() ? app.app_id() : 0,
+                                      app.has_owner_id() ? app.owner_id() : 0);
+            }
+            if (msg.stop_apps_size() > maxLogged) {
+                detail += std::format(", ...(+{})", msg.stop_apps_size() - maxLogged);
+            }
+            LOG_NETPACKET_INFO("FamilySharing: Swallowing StopPlaying seconds_left={} stop_apps=[{}]",
+                               msg.has_seconds_left() ? msg.seconds_left() : -1, detail);
+
+            msg.clear_stop_apps();
+            msg.clear_seconds_left();
+            const auto encSize = msg.ByteSizeLong();
+            if (encSize <= sizeof(g_NewBody) && msg.SerializeToArray(g_NewBody, static_cast<int>(sizeof(g_NewBody)))) {
+                g_cbNewBody = static_cast<uint32>(encSize);
+                g_NeedReplaceBody = true;
+                return;
+            }
         }
 
-        // 正常一次只有一两条，这里仍然设上限：包由服务端给出，
-        // 万一内容异常也不该让日志字符串无界膨胀。
-        constexpr int kMaxLogged = 8;
-        std::string detail;
-        for (int i = 0; i < msg.stop_apps_size() && i < kMaxLogged; ++i) {
-            const auto& app = msg.stop_apps(i);
-            if (!detail.empty()) detail += ", ";
-            detail += std::format("app_id={} owner_id={}",
-                                  app.has_app_id() ? app.app_id() : 0,
-                                  app.has_owner_id() ? app.owner_id() : 0);
-        }
-        if (msg.stop_apps_size() > kMaxLogged) {
-            detail += std::format(", ...(+{})", msg.stop_apps_size() - kMaxLogged);
-        }
-        LOG_NETPACKET_INFO("FamilySharing: StopPlaying seconds_left={} stop_apps=[{}]",
-                           msg.has_seconds_left() ? msg.seconds_left() : -1, detail);
+        g_cbNewBody = 0;
+        g_NeedReplaceBody = true;
     }
 
-    // 运行列表只记录不修改，用于确认服务器对占用名额的判定。
-    void LogRunningApps(const uint8* pBody, uint32 cbBody)
+    void HandleRecv_NotifyRunningApps(const uint8* pBody, uint32 cbBody)
     {
         CFamilyGroupsClient_NotifyRunningApps_Notification notify;
-        if (!notify.ParseFromArray(pBody, cbBody)) return;
-        LOG_NETPACKET_DEBUG("FamilySharing: NotifyRunningApps (family_groupid {}, {} running apps)",
-                            notify.family_groupid(), notify.running_apps_size());
+        if (notify.ParseFromArray(pBody, cbBody)) {
+            const int runningCount = notify.running_apps_size();
+            notify.clear_running_apps();
+
+            const auto encSize = notify.ByteSizeLong();
+            if (encSize <= sizeof(g_NewBody) && notify.SerializeToArray(g_NewBody, static_cast<int>(sizeof(g_NewBody)))) {
+                g_cbNewBody = static_cast<uint32>(encSize);
+                g_NeedReplaceBody = true;
+                LOG_NETPACKET_INFO("FamilySharing: Sanitized NotifyRunningApps (family_groupid {}, cleared {} running apps)",
+                                   notify.family_groupid(), runningCount);
+                return;
+            }
+        }
+
+        g_cbNewBody = 0;
+        g_NeedReplaceBody = true;
     }
 
 } // namespace Hooks_NetPacket_FamilySharing
@@ -1568,7 +1579,7 @@ namespace {
         switch (Fnv1aHash(targetJobName)) {
 
         case HASH_JOB_NotifyRunningApps:
-            Hooks_NetPacket_FamilySharing::LogRunningApps(pBody, cbBody);
+            Hooks_NetPacket_FamilySharing::HandleRecv_NotifyRunningApps(pBody, cbBody);
             return;
 
         case HASH_JOB_GetUserStats:
@@ -1579,11 +1590,9 @@ namespace {
             Hooks_NetPacket_Manifest::HandleRecv(pBody, cbBody, pHdr, cbHdr);
             return;
 
-        // ---- add new 147 service methods here ----
         default:
-            // job 名带版本号后缀时走子串兜底，保证观测点不漏
             if (std::string_view(targetJobName).find("NotifyRunningApps") != std::string_view::npos) {
-                Hooks_NetPacket_FamilySharing::LogRunningApps(pBody, cbBody);
+                Hooks_NetPacket_FamilySharing::HandleRecv_NotifyRunningApps(pBody, cbBody);
                 return;
             }
             break;
@@ -1656,9 +1665,9 @@ namespace {
                 pBody, cbBody);
             return;
 
-        case k_EMsgClientSharedLibraryStopPlaying:     // 9406
-            // 停玩通知照常交给 Steam 处理，这里只记录内容。
-            Hooks_NetPacket_FamilySharing::LogStopPlaying(pBody, cbBody);
+        case k_EMsgClientSharedLibraryLockStatus:
+        case k_EMsgClientSharedLibraryStopPlaying:
+            Hooks_NetPacket_FamilySharing::HandleStopPlaying(pBody, cbBody);
             return;
 
         case k_EMsgClientPersonaState:                 // 766
