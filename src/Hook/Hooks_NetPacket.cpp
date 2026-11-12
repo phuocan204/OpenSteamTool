@@ -697,8 +697,6 @@ namespace Hooks_NetPacket_FamilySharing {
         if (recorded.count(appId)) return;
         recorded.insert(appId);
 
-        LuaConfig::AddDepot(appId);
-
         std::filesystem::path dir;
         if (LuaDir[0] != '\0') {
             dir = LuaDir;
@@ -718,7 +716,7 @@ namespace Hooks_NetPacket_FamilySharing {
             std::string line;
             const std::string appIdStr = std::to_string(appId);
             while (std::getline(in, line)) {
-                if (line.find("addappid") != std::string::npos && line.find(appIdStr) != std::string::npos) {
+                if (line.find(appIdStr) != std::string::npos) {
                     existsInFile = true;
                     break;
                 }
@@ -730,9 +728,9 @@ namespace Hooks_NetPacket_FamilySharing {
             if (out.is_open()) {
                 const std::string name = Hooks_Misc::GetGameNameByAppID(appId);
                 if (!name.empty()) {
-                    out << std::format("addappid({}) -- {}\n", appId, name);
+                    out << std::format("-- addappid({}) -- {}\n", appId, name);
                 } else {
-                    out << std::format("addappid({})\n", appId);
+                    out << std::format("-- addappid({})\n", appId);
                 }
             }
         }
@@ -1303,7 +1301,6 @@ namespace Hooks_NetPacket_OnlineFix {
 
             if (lender > 1 && !inLua) {
                 Hooks_NetPacket_FamilySharing::RecordFamilyBypass(playedAppId);
-                inLua = true;
             }
 
             LOG_NETPACKET_DEBUG("FamilySharing: appid {} reported_owner={} lender_lookup={} inLua={}",
