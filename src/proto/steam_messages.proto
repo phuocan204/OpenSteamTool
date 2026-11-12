@@ -124,6 +124,16 @@ message CFamilyGroupsClient_NotifyRunningApps_Notification {
 // ============================================================
 // CMsgClientSharedLibraryStopPlaying  (eMsg 9406)
 // ============================================================
+message CMsgClientSharedLibraryLockStatus {
+	message LockedLibrary {
+		optional uint32 owner_id = 1;
+		optional uint32 locked_by = 2;
+	}
+
+	repeated .CMsgClientSharedLibraryLockStatus.LockedLibrary locked_library = 1;
+	optional uint32 own_library_locked_by = 2;
+}
+
 message CMsgClientSharedLibraryStopPlaying {
 	optional int32 seconds_left = 1;
 	repeated .CMsgClientSharedLibraryStopPlaying_StopApp stop_apps = 2;

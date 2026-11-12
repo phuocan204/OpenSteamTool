@@ -635,33 +635,72 @@ namespace Hooks_NetPacket_Matchmaking {
 
 namespace Hooks_NetPacket_FamilySharing {
 
+    template <typename FormatItem>
+    std::string FormatBoundedList(int totalSize, FormatItem&& formatItem)
+    {
+        constexpr int maxLogged = 8;
+        std::string detail;
+        for (int i = 0; i < totalSize && i < maxLogged; ++i) {
+            if (!detail.empty()) detail += ", ";
+            detail += formatItem(i);
+        }
+        if (totalSize > maxLogged) {
+            detail += std::format(", ...(+{})", totalSize - maxLogged);
+        }
+        return detail;
+    }
+
+    template <typename Msg>
+    void ApplyClearedBody(const Msg& msg)
+    {
+        const auto encSize = msg.ByteSizeLong();
+        if (encSize <= sizeof(g_NewBody) && msg.SerializeToArray(g_NewBody, static_cast<int>(sizeof(g_NewBody)))) {
+            g_cbNewBody = static_cast<uint32>(encSize);
+            g_NeedReplaceBody = true;
+            return;
+        }
+        g_cbNewBody = 0;
+        g_NeedReplaceBody = true;
+    }
+
+    void HandleLockStatus(const uint8* pBody, uint32 cbBody)
+    {
+        CMsgClientSharedLibraryLockStatus msg;
+        if (msg.ParseFromArray(pBody, cbBody)) {
+            const std::string detail = FormatBoundedList(msg.locked_library_size(), [&](int i) {
+                const auto& lib = msg.locked_library(i);
+                return std::format("owner_id={} locked_by={}",
+                                   lib.has_owner_id() ? lib.owner_id() : 0,
+                                   lib.has_locked_by() ? lib.locked_by() : 0);
+            });
+            LOG_NETPACKET_INFO("FamilySharing: Clearing LockStatus own_library_locked_by={} locked_library=[{}]",
+                               msg.has_own_library_locked_by() ? msg.own_library_locked_by() : 0, detail);
+
+            msg.Clear();
+            ApplyClearedBody(msg);
+            return;
+        }
+
+        g_cbNewBody = 0;
+        g_NeedReplaceBody = true;
+    }
+
     void HandleStopPlaying(const uint8* pBody, uint32 cbBody)
     {
         CMsgClientSharedLibraryStopPlaying msg;
         if (msg.ParseFromArray(pBody, cbBody)) {
-            constexpr int maxLogged = 8;
-            std::string detail;
-            for (int i = 0; i < msg.stop_apps_size() && i < maxLogged; ++i) {
+            const std::string detail = FormatBoundedList(msg.stop_apps_size(), [&](int i) {
                 const auto& app = msg.stop_apps(i);
-                if (!detail.empty()) detail += ", ";
-                detail += std::format("app_id={} owner_id={}",
-                                      app.has_app_id() ? app.app_id() : 0,
-                                      app.has_owner_id() ? app.owner_id() : 0);
-            }
-            if (msg.stop_apps_size() > maxLogged) {
-                detail += std::format(", ...(+{})", msg.stop_apps_size() - maxLogged);
-            }
+                return std::format("app_id={} owner_id={}",
+                                   app.has_app_id() ? app.app_id() : 0,
+                                   app.has_owner_id() ? app.owner_id() : 0);
+            });
             LOG_NETPACKET_INFO("FamilySharing: Swallowing StopPlaying seconds_left={} stop_apps=[{}]",
                                msg.has_seconds_left() ? msg.seconds_left() : -1, detail);
 
-            msg.clear_stop_apps();
-            msg.clear_seconds_left();
-            const auto encSize = msg.ByteSizeLong();
-            if (encSize <= sizeof(g_NewBody) && msg.SerializeToArray(g_NewBody, static_cast<int>(sizeof(g_NewBody)))) {
-                g_cbNewBody = static_cast<uint32>(encSize);
-                g_NeedReplaceBody = true;
-                return;
-            }
+            msg.Clear();
+            ApplyClearedBody(msg);
+            return;
         }
 
         g_cbNewBody = 0;
@@ -689,13 +728,55 @@ namespace Hooks_NetPacket_FamilySharing {
         g_NeedReplaceBody = true;
     }
 
+    bool IsIdentChar(char c)
+    {
+        return (c >= '0' && c <= '9') ||
+               (c >= 'a' && c <= 'z') ||
+               (c >= 'A' && c <= 'Z') ||
+               c == '_';
+    }
+
+    bool LineHasAddAppId(const std::string& line, const std::string& appIdStr)
+    {
+        size_t pos = 0;
+        while ((pos = line.find("addappid", pos)) != std::string::npos) {
+            const bool validStart = (pos == 0) || !IsIdentChar(line[pos - 1]);
+            pos += 8;
+            if (!validStart) continue;
+
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+                ++pos;
+            }
+            if (pos >= line.size() || line[pos] != '(') continue;
+            ++pos;
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+                ++pos;
+            }
+
+            const size_t numStart = pos;
+            while (pos < line.size() && line[pos] >= '0' && line[pos] <= '9') {
+                ++pos;
+            }
+            if (pos == numStart) continue;
+
+            const size_t numEnd = pos;
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+                ++pos;
+            }
+            if (pos < line.size() && (line[pos] == ',' || line[pos] == ')')) {
+                if (line.compare(numStart, numEnd - numStart, appIdStr) == 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     void RecordFamilyBypass(AppId_t appId)
     {
         static std::mutex mutex;
         std::lock_guard<std::mutex> lock(mutex);
         static std::unordered_set<AppId_t> recorded;
-        if (recorded.count(appId)) return;
-        recorded.insert(appId);
 
         std::filesystem::path dir;
         if (LuaDir[0] != '\0') {
@@ -707,31 +788,58 @@ namespace Hooks_NetPacket_FamilySharing {
         }
 
         std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
         std::filesystem::path filePath = dir / "family_bypass.lua";
+        const bool fileExists = std::filesystem::exists(filePath, ec);
+        if (recorded.count(appId) && fileExists) return;
+
+        std::filesystem::create_directories(dir, ec);
 
         bool existsInFile = false;
-        if (std::filesystem::exists(filePath, ec)) {
-            std::ifstream in(filePath);
-            std::string line;
-            const std::string appIdStr = std::to_string(appId);
-            while (std::getline(in, line)) {
-                if (line.find(appIdStr) != std::string::npos) {
-                    existsInFile = true;
-                    break;
+        bool needsNewline = false;
+        if (fileExists) {
+            std::ifstream in(filePath, std::ios::binary);
+            if (in.is_open()) {
+                in.seekg(0, std::ios::end);
+                const auto fileSize = in.tellg();
+                if (fileSize > 0) {
+                    in.seekg(-1, std::ios::end);
+                    char lastByte = '\n';
+                    if (in.get(lastByte) && lastByte != '\n') {
+                        needsNewline = true;
+                    }
+                }
+                in.clear();
+                in.seekg(0, std::ios::beg);
+
+                std::string line;
+                const std::string appIdStr = std::to_string(appId);
+                while (std::getline(in, line)) {
+                    if (LineHasAddAppId(line, appIdStr)) {
+                        existsInFile = true;
+                        break;
+                    }
                 }
             }
         }
 
-        if (!existsInFile) {
-            std::ofstream out(filePath, std::ios::app);
-            if (out.is_open()) {
-                const std::string name = Hooks_Misc::GetGameNameByAppID(appId);
-                if (!name.empty()) {
-                    out << std::format("-- addappid({}) -- {}\n", appId, name);
-                } else {
-                    out << std::format("-- addappid({})\n", appId);
-                }
+        if (existsInFile) {
+            recorded.insert(appId);
+            return;
+        }
+
+        std::ofstream out(filePath, std::ios::app);
+        if (out.is_open()) {
+            if (needsNewline) {
+                out << '\n';
+            }
+            const std::string name = Hooks_Misc::GetGameNameByAppID(appId);
+            if (!name.empty()) {
+                out << std::format("-- addappid({}) -- {}\n", appId, name);
+            } else {
+                out << std::format("-- addappid({})\n", appId);
+            }
+            if (out.good()) {
+                recorded.insert(appId);
             }
         }
     }
@@ -1809,6 +1917,9 @@ namespace {
             return;
 
         case k_EMsgClientSharedLibraryLockStatus:
+            Hooks_NetPacket_FamilySharing::HandleLockStatus(pBody, cbBody);
+            return;
+
         case k_EMsgClientSharedLibraryStopPlaying:
             Hooks_NetPacket_FamilySharing::HandleStopPlaying(pBody, cbBody);
             return;
