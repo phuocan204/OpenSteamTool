@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <windows.h>
 
 #include "steam_messages.pb.h"
 
@@ -543,6 +544,10 @@ namespace Hooks_NetPacket_ETicket {
 // ════════════════════════════════════════════════════════════════
 //  Hooks_NetPacket_FamilySharing
 // ════════════════════════════════════════════════════════════════
+namespace Hooks_NetPacket_RichPresence {
+    extern uint64 g_LocalSteamId;
+}
+
 namespace Hooks_NetPacket_Matchmaking {
 
     struct SharedLobbyData {
