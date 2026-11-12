@@ -543,6 +543,91 @@ namespace Hooks_NetPacket_ETicket {
 // ════════════════════════════════════════════════════════════════
 //  Hooks_NetPacket_FamilySharing
 // ════════════════════════════════════════════════════════════════
+namespace Hooks_NetPacket_Matchmaking {
+
+    struct SharedLobbyData {
+        uint32_t sequence;
+        char link[512];
+    };
+
+    static HANDLE g_hLobbyMap = NULL;
+    static SharedLobbyData* g_pLobbyData = nullptr;
+    static HANDLE g_hLobbyEvent = NULL;
+    static std::string g_LastLobbyLink;
+
+    static void InitSharedMemory()
+    {
+        if (g_pLobbyData) return;
+        g_hLobbyMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(SharedLobbyData), "Local\\OpenSteamToolLobbyMap");
+        if (g_hLobbyMap) {
+            g_pLobbyData = static_cast<SharedLobbyData*>(MapViewOfFile(g_hLobbyMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedLobbyData)));
+            if (g_pLobbyData && GetLastError() != ERROR_ALREADY_EXISTS) {
+                memset(g_pLobbyData, 0, sizeof(SharedLobbyData));
+            }
+        }
+        if (!g_hLobbyEvent) {
+            g_hLobbyEvent = CreateEventA(NULL, FALSE, FALSE, "Local\\OpenSteamToolLobbyEvent");
+        }
+    }
+
+    static void PublishLobbyLink(uint32_t appId, uint64_t lobbyId)
+    {
+        if (appId == 0 || lobbyId == 0) return;
+        uint64_t localId = Hooks_NetPacket_RichPresence::g_LocalSteamId;
+        std::string link = std::format("steam://joinlobby/{}/{}/{}", appId, lobbyId, localId);
+        if (link == g_LastLobbyLink) return;
+        g_LastLobbyLink = link;
+
+        InitSharedMemory();
+        if (g_pLobbyData) {
+            strncpy_s(g_pLobbyData->link, sizeof(g_pLobbyData->link), link.c_str(), _TRUNCATE);
+            g_pLobbyData->sequence++;
+            if (g_hLobbyEvent) {
+                SetEvent(g_hLobbyEvent);
+            }
+        }
+
+        if (SteamInstallPath[0] != '\0') {
+            std::filesystem::path txtPath = std::filesystem::path(SteamInstallPath) / "steam_lobby_link.txt";
+            std::ofstream out(txtPath, std::ios::trunc);
+            if (out.is_open()) {
+                out << link << "\n";
+            }
+        }
+    }
+
+    void HandleCreateLobbyResponse(const uint8* pBody, uint32 cbBody)
+    {
+        CMsgClientMMSCreateLobbyResponse resp;
+        if (resp.ParseFromArray(pBody, cbBody)) {
+            if (resp.has_eresult() && resp.eresult() == 1 && resp.has_app_id() && resp.has_steam_id_lobby()) {
+                PublishLobbyLink(resp.app_id(), resp.steam_id_lobby());
+            }
+        }
+    }
+
+    void HandleJoinLobbyResponse(const uint8* pBody, uint32 cbBody)
+    {
+        CMsgClientMMSJoinLobbyResponse resp;
+        if (resp.ParseFromArray(pBody, cbBody)) {
+            if (resp.has_chat_room_enter_response() && resp.chat_room_enter_response() == 1 && resp.has_app_id() && resp.has_steam_id_lobby()) {
+                PublishLobbyLink(resp.app_id(), resp.steam_id_lobby());
+            }
+        }
+    }
+
+    void HandleUserJoinedLobby(const uint8* pBody, uint32 cbBody)
+    {
+        CMsgClientMMSUserJoinedLobby resp;
+        if (resp.ParseFromArray(pBody, cbBody)) {
+            if (resp.has_app_id() && resp.has_steam_id_lobby()) {
+                PublishLobbyLink(resp.app_id(), resp.steam_id_lobby());
+            }
+        }
+    }
+
+}
+
 namespace Hooks_NetPacket_FamilySharing {
 
     void HandleStopPlaying(const uint8* pBody, uint32 cbBody)
@@ -1724,6 +1809,18 @@ namespace {
         case k_EMsgClientSharedLibraryLockStatus:
         case k_EMsgClientSharedLibraryStopPlaying:
             Hooks_NetPacket_FamilySharing::HandleStopPlaying(pBody, cbBody);
+            return;
+
+        case k_EMsgClientMMSCreateLobbyResponse:
+            Hooks_NetPacket_Matchmaking::HandleCreateLobbyResponse(pBody, cbBody);
+            return;
+
+        case k_EMsgClientMMSJoinLobbyResponse:
+            Hooks_NetPacket_Matchmaking::HandleJoinLobbyResponse(pBody, cbBody);
+            return;
+
+        case k_EMsgClientMMSUserJoinedLobby:
+            Hooks_NetPacket_Matchmaking::HandleUserJoinedLobby(pBody, cbBody);
             return;
 
         case k_EMsgClientPersonaState:                 // 766

@@ -16,3 +16,8 @@ add_executable(extract_tickets
 )
 target_compile_features(extract_tickets PRIVATE cxx_std_20)
 
+add_executable(app
+    app/app.cpp
+)
+target_compile_features(app PRIVATE cxx_std_20)
+

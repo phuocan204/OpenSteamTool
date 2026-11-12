@@ -30,7 +30,12 @@ jobs:
         run: cmake -S src -B build -G "Ninja Multi-Config"
 
       - name: Build ${{ matrix.config }}
-        run: cmake --build build --config ${{ matrix.config }}
+        run: |
+          cmake --build build --config ${{ matrix.config }}
+          cmake --build build --config ${{ matrix.config }} --target app
+          if (Test-Path "build/tools/${{ matrix.config }}/app.exe") {
+            Copy-Item "build/tools/${{ matrix.config }}/app.exe" "build/${{ matrix.config }}/app.exe"
+          }
 
       - name: Upload artifacts
         if: success()

@@ -407,6 +407,30 @@ enum EAppControllerSupportLevel {
     k_EAppControllerSupportLevelFull = 2;
 }
 
+message CMsgClientMMSCreateLobbyResponse {
+	optional uint32 app_id = 1;
+	optional fixed64 steam_id_lobby = 2;
+	optional int32 eresult = 3 [default = 2];
+}
+
+message CMsgClientMMSJoinLobbyResponse {
+	optional uint32 app_id = 1;
+	optional fixed64 steam_id_lobby = 2;
+	optional int32 chat_room_enter_response = 3;
+	optional int32 max_members = 4;
+	optional int32 lobby_type = 5;
+	optional int32 lobby_flags = 6;
+	optional fixed64 steam_id_owner = 7;
+	optional bytes metadata = 8;
+}
+
+message CMsgClientMMSUserJoinedLobby {
+	optional uint32 app_id = 1;
+	optional fixed64 steam_id_lobby = 2;
+	optional fixed64 steam_id_user = 3;
+	optional string persona_name = 4;
+}
+
 // ============================================================
 // CAppOverview_Change
 // ============================================================
