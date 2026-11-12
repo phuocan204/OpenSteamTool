@@ -16,10 +16,12 @@
 #include <deque>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "steam_messages.pb.h"
@@ -597,6 +599,55 @@ namespace Hooks_NetPacket_FamilySharing {
         g_NeedReplaceBody = true;
     }
 
+    void RecordFamilyBypass(AppId_t appId)
+    {
+        static std::mutex mutex;
+        std::lock_guard<std::mutex> lock(mutex);
+        static std::unordered_set<AppId_t> recorded;
+        if (recorded.count(appId)) return;
+        recorded.insert(appId);
+
+        LuaConfig::AddDepot(appId);
+
+        std::filesystem::path dir;
+        if (LuaDir[0] != '\0') {
+            dir = LuaDir;
+        } else if (SteamInstallPath[0] != '\0') {
+            dir = std::filesystem::path(SteamInstallPath) / "config" / "lua";
+        } else {
+            dir = std::filesystem::path("config") / "lua";
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::filesystem::path filePath = dir / "family_bypass.lua";
+
+        bool existsInFile = false;
+        if (std::filesystem::exists(filePath, ec)) {
+            std::ifstream in(filePath);
+            std::string line;
+            const std::string appIdStr = std::to_string(appId);
+            while (std::getline(in, line)) {
+                if (line.find("addappid") != std::string::npos && line.find(appIdStr) != std::string::npos) {
+                    existsInFile = true;
+                    break;
+                }
+            }
+        }
+
+        if (!existsInFile) {
+            std::ofstream out(filePath, std::ios::app);
+            if (out.is_open()) {
+                const std::string name = Hooks_Misc::GetGameNameByAppID(appId);
+                if (!name.empty()) {
+                    out << std::format("addappid({}) -- {}\n", appId, name);
+                } else {
+                    out << std::format("addappid({})\n", appId);
+                }
+            }
+        }
+    }
+
 } // namespace Hooks_NetPacket_FamilySharing
 
 
@@ -1158,7 +1209,12 @@ namespace Hooks_NetPacket_OnlineFix {
             const AccountID_t lender = Hooks_Package::GetFamilySharedOwner(playedAppId);
             // inLua 传 true 会把已标记为真拥有的 AppId 排除掉：自购游戏写进
             // lua 只是为了补 DLC，主游戏本身走正版路线，上报不能动它的报文。
-            const bool inLua = LuaConfig::HasDepot(playedAppId, true);
+            bool inLua = LuaConfig::HasDepot(playedAppId, true);
+
+            if (lender > 1 && !inLua) {
+                Hooks_NetPacket_FamilySharing::RecordFamilyBypass(playedAppId);
+                inLua = true;
+            }
 
             LOG_NETPACKET_DEBUG("FamilySharing: appid {} reported_owner={} lender_lookup={} inLua={}",
                                 playedAppId, reported, lender, inLua);

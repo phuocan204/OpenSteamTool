@@ -507,6 +507,12 @@ namespace LuaConfig{
         return DepotKeySet.count(DepotId) && (!excludeOwned || !IsOwned(DepotId));
     }
 
+    void AddDepot(AppId_t appId) {
+        if (!DepotKeySet.count(appId)) {
+            DepotKeySet[appId] = "";
+        }
+    }
+
     bool IsOwned(AppId_t AppId) {
         return OwnedAppIdSet.count(AppId);
     }

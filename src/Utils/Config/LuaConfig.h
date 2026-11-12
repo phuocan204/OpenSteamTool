@@ -11,6 +11,7 @@
 
 namespace LuaConfig{
     bool HasDepot(AppId_t appId, bool checkOwned=true);
+    void AddDepot(AppId_t appId);
     bool IsOwned(AppId_t appId);
     void MarkOwned(AppId_t appId);
     // 是否配过 forcedenuvo(appid)：识别漏判时手动按 Denuvo 处理。
