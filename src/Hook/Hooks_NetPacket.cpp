@@ -1484,14 +1484,14 @@ namespace Hooks_NetPacket_OnlineFix {
                                 playedAppId, reported, lender, inLua);
 
             if (lender > 1 && inLua) {
+                game->set_game_id(kFamilySharedMaskAppId);
                 if (!broadcast) {
-                    game->set_game_id(kFamilySharedMaskAppId);
                     game->clear_game_extra_info();
                 }
                 game->clear_owner_id();
                 patched = true;
                 LOG_NETPACKET_INFO("FamilySharing: appid {} -> {} (shared+lua, lender {})",
-                                   playedAppId, broadcast ? playedAppId : kFamilySharedMaskAppId, lender);
+                                   playedAppId, kFamilySharedMaskAppId, lender);
                 continue;
             }
 
@@ -2063,6 +2063,15 @@ namespace {
     {
         g_NeedReplaceBody = false;
         g_NeedReplaceHdr  = false;
+
+        if (Hooks_NetPacket_RichPresence::g_LocalSteamId == 0 && pHdr && cbHdr > 0) {
+            CMsgProtoBufHeader hdr;
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_steamid() && (hdr.steamid() & 0xFFFFFFFFull) != 0) {
+                Hooks_NetPacket_RichPresence::g_LocalSteamId = hdr.steamid();
+                CloudRedirectHost::SetAccountId(
+                    static_cast<uint32_t>(hdr.steamid() & 0xFFFFFFFFull));
+            }
+        }
 
         if(eMsg == k_EMsgMulti) {
             LOG_NETPACKET_TRACE("Received k_EMsgMulti, skipping dispatch");
