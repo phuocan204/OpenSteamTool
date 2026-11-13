@@ -980,6 +980,7 @@ namespace Hooks_NetPacket_Manifest {
 namespace Hooks_NetPacket_RichPresence {
 
     AppId_t g_PlayingAppId = 0;
+    AppId_t g_CloudRunningAppId = 0;
     uint64  g_LocalSteamId = 0;
 
     // Most recent self-PersonaState bytes captured from a real server push.
@@ -1166,21 +1167,34 @@ namespace Hooks_NetPacket_RichPresence {
                 msg.games_played(msg.games_played_size() - 1).game_id() & UINT32_MAX);
         }
 
+        AppId_t newCloudTracked = 0;
+        if (topmost != 0) {
+            if (Hooks_Misc::IsOnlineFixActive() && Hooks_Misc::IsOnlineFixFakeAppId(topmost)) {
+                AppId_t resolved = Hooks_Misc::ResolveAppId();
+                if (resolved != 0 && (LuaConfig::HasDepot(resolved) || CloudRedirectHost::IsApp(resolved)))
+                    newCloudTracked = resolved;
+            } else if (LuaConfig::HasDepot(topmost) || CloudRedirectHost::IsApp(topmost)) {
+                newCloudTracked = topmost;
+            }
+        }
+        if (g_CloudRunningAppId != newCloudTracked) {
+            AppId_t oldCloudTracked = g_CloudRunningAppId;
+            g_CloudRunningAppId = newCloudTracked;
+            if (oldCloudTracked != 0)
+                CloudRedirectHost::NotifyAppRunning(oldCloudTracked, false);
+            if (newCloudTracked != 0)
+                CloudRedirectHost::NotifyAppRunning(newCloudTracked, true);
+        }
+
         // Only track when the topmost is an unlocked AppId we can inject for.
         // Owned games on top let the server's natural broadcast paint the
         // cache; -onlinefix games are already handled by the OnlineFix path.
         AppId_t newTracked = 0;
-        if (topmost != 0 && topmost != kOnlineFixAppId && LuaConfig::HasDepot(topmost))
+        if (topmost != 0 && topmost != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(topmost) && LuaConfig::HasDepot(topmost))
             newTracked = topmost;
 
         if (g_PlayingAppId == newTracked) return;
-        AppId_t oldTracked = g_PlayingAppId;
         g_PlayingAppId = newTracked;
-
-        if (oldTracked != 0)
-            CloudRedirectHost::NotifyAppRunning(oldTracked, false);
-        if (newTracked != 0)
-            CloudRedirectHost::NotifyAppRunning(newTracked, true);
 
         // With display = "none" I skip scheduling broadcast injects here;
         // the running-state tracking above stays intact.
@@ -1336,28 +1350,34 @@ namespace Hooks_NetPacket_OnlineFix {
         // 采用独立标记跟踪广播重写状态：480 那条已经改写过名称之后，
         // 就不再走下面按 RichPresence 重写游戏名的分支。
         bool didBroadcastRewrite = false;
+        bool hasOnlineFixApp = false;
         for (int i = 0; i < msg.games_played_size(); ++i) {
             auto* game = msg.mutable_games_played(i);
             AppId_t appid = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
 
+            if (Hooks_Misc::IsOnlineFixFakeAppId(appid)) {
+                hasOnlineFixApp = true;
+            }
+
             // SpawnProcess rewrites pGameID to 480, so game_id is already 480.
             // Fill game_extra_info with the real game name.
-            if (broadcast && appid == kOnlineFixAppId) {
+            if (broadcast && (appid == kOnlineFixAppId || Hooks_Misc::IsOnlineFixFakeAppId(appid))) {
                 AppId_t realAppId = Hooks_Misc::ResolveAppId();
                 // 只排除占位值，不再要求 appid 在 Lua 名单里：正版拥有的游戏
                 // 加 -onlinefix 联机时同样要显示游戏名，否则好友侧只看到 480。
-                if (realAppId && realAppId != kOnlineFixAppId) {
+                if (realAppId && realAppId != appid) {
                     std::string name = Hooks_Misc::GetGameNameByAppID(realAppId);
                     if (!name.empty()) {
                         game->set_game_extra_info(name);
                         patched = true;
                         didBroadcastRewrite = true;
-                        LOG_ONLINEFIX_INFO("OnlineFix: 480 -> name '{}' (real appid {})",
-                            name, realAppId);
+                        LOG_ONLINEFIX_INFO("OnlineFix: {} -> name '{}' (real appid {})",
+                            appid, name, realAppId);
                     }
                 }
             }
         }
+        Hooks_Misc::OnGamesPlayedUpdated(hasOnlineFixApp);
 
         // Rich Presence: rewrite topmost unowned game to use the first
         // available shortcut's game_id so the server broadcasts it as a
@@ -1367,7 +1387,7 @@ namespace Hooks_NetPacket_OnlineFix {
         // 没开播报时这里整体跳过，家庭共享 + lua 才会落到专用分支改替代 id。
         if (broadcast && !didBroadcastRewrite) {
             AppId_t trackedId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
-            if (trackedId != 0 && trackedId != kOnlineFixAppId && msg.games_played_size() > 0) {
+            if (trackedId != 0 && trackedId != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(trackedId) && msg.games_played_size() > 0) {
                 std::string name = Hooks_Misc::GetGameNameByAppID(trackedId);
                 if (!name.empty()) {
                     auto* topGame = msg.mutable_games_played(msg.games_played_size() - 1);
@@ -1532,13 +1552,59 @@ namespace Hooks_NetPacket_Cloud {
         return false;
     }
 
+    static uint32 GetAppIdFieldNum(const char* jobName) {
+        if (std::strcmp(jobName, "Cloud.ClientCommitFileUpload#1") == 0)
+            return 2;
+        return 1;
+    }
+
+    static bool RewriteVarintField(const uint8* d, uint32 size, uint32 target, uint64 newValue, std::vector<uint8>& out) {
+        uint32 pos = 0;
+        while (pos < size) {
+            uint64 tag;
+            if (!ReadVarint(d, size, pos, tag)) return false;
+            const uint32 field = static_cast<uint32>(tag >> 3);
+            const uint32 wireType = static_cast<uint32>(tag & 7);
+            if (field == target && wireType == 0) {
+                uint32 valStart = pos;
+                uint64 oldVal = 0;
+                if (!ReadVarint(d, size, pos, oldVal)) return false;
+                uint32 valEnd = pos;
+                out.clear();
+                out.reserve(size + 10);
+                out.insert(out.end(), d, d + valStart);
+                uint64 v = newValue;
+                do {
+                    uint8 byte = static_cast<uint8>(v & 0x7F);
+                    v >>= 7;
+                    if (v != 0) byte |= 0x80;
+                    out.push_back(byte);
+                } while (v != 0);
+                out.insert(out.end(), d + valEnd, d + size);
+                return true;
+            }
+            switch (wireType) {
+            case 0: { uint64 tmp; if (!ReadVarint(d, size, pos, tmp)) return false; break; }
+            case 1: if (pos + 8 > size) return false; pos += 8; break;
+            case 5: if (pos + 4 > size) return false; pos += 4; break;
+            case 2: {
+                uint64 len;
+                if (!ReadVarint(d, size, pos, len)) return false;
+                if (pos + len > size) return false;
+                pos += static_cast<uint32>(len);
+                break;
+            }
+            default: return false;
+            }
+        }
+        return false;
+    }
+
     // appid lives in field 1 of every Cloud.* request except
     // ClientCommitFileUpload, where it is field 2 (mirrors CloudRedirect's
     // CloudRpcUtils::ExtractAppId).
     static uint32 ExtractAppId(const char* jobName, const uint8* body, uint32 cbBody) {
-        uint32 fieldNum = 1;
-        if (std::strcmp(jobName, "Cloud.ClientCommitFileUpload#1") == 0)
-            fieldNum = 2;
+        uint32 fieldNum = GetAppIdFieldNum(jobName);
         uint64 v = 0;
         if (FindVarintField(body, cbBody, fieldNum, v))
             return static_cast<uint32>(v);
@@ -1557,17 +1623,37 @@ namespace Hooks_NetPacket_Cloud {
         if (!reqHdr.ParseFromArray(pHdr, cbHdr)) return false;
         if (reqHdr.has_steamid() && reqHdr.steamid())
             g_localSteamId = reqHdr.steamid();
+        else if (g_localSteamId == 0 && Hooks_NetPacket_RichPresence::g_LocalSteamId != 0)
+            g_localSteamId = Hooks_NetPacket_RichPresence::g_LocalSteamId;
 
-        const uint32 appId = ExtractAppId(jobName, pBody, cbBody);
-        if (appId == 0 || !CloudRedirectHost::IsApp(appId)) return false;
+        const uint32 rawAppId = ExtractAppId(jobName, pBody, cbBody);
+        if (rawAppId == 0) return false;
+
+        uint32 targetAppId = rawAppId;
+        std::vector<uint8> rewrittenBody;
+        const uint8* reqBodyPtr = pBody;
+        uint32 reqBodyLen = cbBody;
+
+        if (Hooks_Misc::IsOnlineFixActive() && Hooks_Misc::IsOnlineFixFakeAppId(rawAppId)) {
+            uint32 resolved = Hooks_Misc::ResolveAppId();
+            if (resolved != 0 && CloudRedirectHost::IsApp(resolved)) {
+                if (RewriteVarintField(pBody, cbBody, GetAppIdFieldNum(jobName), resolved, rewrittenBody)) {
+                    targetAppId = resolved;
+                    reqBodyPtr = rewrittenBody.data();
+                    reqBodyLen = static_cast<uint32>(rewrittenBody.size());
+                }
+            }
+        }
+
+        if (!CloudRedirectHost::IsApp(targetAppId)) return false;
 
         const uint32 accountId = static_cast<uint32>(g_localSteamId & 0xFFFFFFFFull);
 
         static thread_local uint8 respBuf[kMaxBodySize];
         uint32  respLen  = 0;
         int32_t eresult  = 2;   // EResult::Fail
-        if (!CloudRedirectHost::HandleCloudRpc(jobName, appId, accountId,
-                                               pBody, cbBody,
+        if (!CloudRedirectHost::HandleCloudRpc(jobName, targetAppId, accountId,
+                                               reqBodyPtr, reqBodyLen,
                                                respBuf, static_cast<uint32_t>(sizeof(respBuf)),
                                                &respLen, &eresult)) {
             return false;   // not a namespace app / unrecognised — let it pass through
@@ -1605,7 +1691,7 @@ namespace Hooks_NetPacket_Cloud {
                 g_pending.push_back(std::move(pkt));
         }
         LOG_NETPACKET_DEBUG("Cloud: handled {} app={} -> queued {}-byte response (eresult={})",
-                            jobName, appId, total, eresult);
+                            jobName, targetAppId, total, eresult);
         return true;
     }
 
@@ -1777,6 +1863,15 @@ namespace {
         g_NeedReplaceSend = false;
         g_SuppressSend    = false;
 
+        if (Hooks_NetPacket_RichPresence::g_LocalSteamId == 0 && pHdr && cbHdr > 0) {
+            CMsgProtoBufHeader hdr;
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_steamid() && hdr.steamid()) {
+                Hooks_NetPacket_RichPresence::g_LocalSteamId = hdr.steamid();
+                CloudRedirectHost::SetAccountId(
+                    static_cast<uint32_t>(hdr.steamid() & 0xFFFFFFFF));
+            }
+        }
+
         LOG_NETPACKET_DEBUG("Send eMsg {}({}) (cbBody={}, cbHdr={})",
                         MsgName(eMsg), static_cast<uint32>(eMsg), cbBody, cbHdr);
 
@@ -1808,7 +1903,9 @@ namespace {
             return;
 
         case k_EMsgClientStoreUserStats2: {         // 5466
-            AppId_t appId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+            AppId_t appId = Hooks_NetPacket_RichPresence::g_CloudRunningAppId;
+            if (appId == 0)
+                appId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
             if (appId != 0)
                 CloudRedirectHost::NotifyStatsStored(appId);
             return;

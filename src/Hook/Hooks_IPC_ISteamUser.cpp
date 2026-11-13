@@ -43,7 +43,14 @@ namespace {
         if (req.cbMaxTicket() < 0) return;
 
         AppTicket::AppOwnershipTicket ticket{};
-        AppId_t appId = req.unAppID() == kOnlineFixAppId ? Hooks_Misc::ResolveAppId() : req.unAppID();
+        AppId_t appId = req.unAppID();
+        if (Hooks_Misc::IsOnlineFixFakeAppId(appId)) {
+            if (!Hooks_Misc::ShouldReportOnlineFixAppId()) {
+                GetAppOwnershipTicketExtendedDataResp existing{pWrite, static_cast<size_t>(req.cbMaxTicket())};
+                if (existing.ok() && existing.returnValue() > 0) return;
+            }
+            appId = Hooks_Misc::ResolveAppId();
+        }
         
         AppTicket::AppTicketSource ticketSource;
         if (PipeManager::DenuvoAuth::IsAuthorizedPipe(pipe)) {

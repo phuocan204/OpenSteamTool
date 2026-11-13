@@ -42,9 +42,34 @@ namespace {
     };
     std::vector<ResolvedHandler> g_Handlers;
 
-    // IClientUtils::GetAppID 的 funcHash，注册时填。onlinefix 的 480 翻转要靠
-    // 这个接口在 appid 不在 Lua 名单的情况下也照常分发，其余 handler 不放行。
     uint32 g_onlineFixAppIdHash = 0;
+    std::vector<uint32> g_networkingCertHashes;
+
+    static void ResolveNetworkingCertHashes() {
+        g_networkingCertHashes.clear();
+        constexpr const char* kCertMethods[] = {
+            "GetCertAsync",
+            "SendP2PRendezvous",
+            "PostConnectionStateMsg",
+            "AllowDirectConnectToPeer",
+            "BeginAsyncRequestFakeIP",
+        };
+        for (const char* method : kCertMethods) {
+            if (const auto* m = IPCLoader::Find("IClientNetworkingSocketsSerialized", method)) {
+                g_networkingCertHashes.push_back(m->funcHash);
+                LOG_IPC_DEBUG("Hooks_IPC: resolved cert trigger IClientNetworkingSocketsSerialized::{} -> 0x{:08X}",
+                              method, m->funcHash);
+            }
+        }
+    }
+
+    static bool IsNetworkingCertCall(uint32 funcHash) {
+        if (g_networkingCertHashes.empty()) return true;
+        for (uint32 h : g_networkingCertHashes) {
+            if (h == funcHash) return true;
+        }
+        return false;
+    }
 
     static ResolvedHandler* FindHandler(EIPCInterface iface, uint32 funcHash) {
         for (auto& e : g_Handlers) {
@@ -136,8 +161,10 @@ namespace {
         IPCMessages::IPCInterfaceCall call{request.body()};
         if (!call.ok()) return;
 
-        if (call.interfaceID() == EIPCInterface::IClientNetworkingSocketsSerialized)
+        if (call.interfaceID() == EIPCInterface::IClientNetworkingSocketsSerialized &&
+            IsNetworkingCertCall(call.funcHash())) {
             Hooks_Misc::NotifyNetworkingSocketsUsed();
+        }
     }
 
     HOOK_FUNC(IPCProcessMessage, bool,void* pServer, HSteamPipe hSteamPipe,
@@ -177,6 +204,7 @@ namespace Hooks_IPC {
         // IPCLoader metadata happens inside RegisterHandlers.
         Hooks_IPC_ISteamUser::Register();
         Hooks_IPC_ISteamUtils::Register();
+        ResolveNetworkingCertHashes();
 
         LOG_IPC_INFO("Hooks_IPC: {} handlers registered", g_Handlers.size());
 
@@ -191,6 +219,7 @@ namespace Hooks_IPC {
         // hash 跟着一起清，否则重装前遗留的值会指向不存在的表项。
         g_Handlers.clear();
         g_onlineFixAppIdHash = 0;
+        g_networkingCertHashes.clear();
         UNHOOK_BEGIN();
         UNINSTALL_HOOK_C(IPCProcessMessage);
         UNHOOK_END();

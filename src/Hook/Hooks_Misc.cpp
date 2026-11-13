@@ -2,6 +2,9 @@
 #include "HookMacros.h"
 #include "Utils/HookSupport/VehCommon.h"
 #include "dllmain.h"
+#include <cctype>
+#include <cstdlib>
+#include <windows.h>
 
 namespace {
     // ── Resolve-only functions ─────────────────────────────────────
@@ -12,15 +15,75 @@ namespace {
     CAPTURE_THIS_FUNC(GetAppIDForCurrentPipe, AppId_t,      g_steamEngine,    void*);
     CAPTURE_THIS_FUNC(GetAppDataFromAppInfo,  int64,        g_pCAppInfoCache, void*, AppId_t, const char*, uint8*, int32);
 
-    // Assumes one game at a time.  Set by SpawnProcess VEH when -onlinefix
-    // is detected; cleared when a non-onlinefix game launches.
-    AppId_t   g_OnlineFixRealAppId;
-    // 游戏开始走 SteamNetworkingSockets 之后置位，见 GetAppID 处理器。
-    bool      g_NetworkingSocketsActive;
-    // 本次启动是否用 -realappid 关掉 appid 翻转，见 ShouldReportOnlineFixAppId。
-    bool      g_SuppressAppIdFlip;
+    AppId_t   g_OnlineFixRealAppId = 0;
+    AppId_t   g_OnlineFixFakeAppId = kOnlineFixAppId;
+    bool      g_NetworkingSocketsActive = false;
+    bool      g_SuppressAppIdFlip = false;
+    bool      g_OnlineFixGamesPlayedSeen = false;
     std::unordered_map<AppId_t, std::string> g_GameNameCache;
 
+    static const char* FindFlagToken(const char* cmdLine, const char* flag) {
+        if (!cmdLine || !flag) return nullptr;
+        const size_t flagLen = strlen(flag);
+        const char* cur = cmdLine;
+        while ((cur = strstr(cur, flag)) != nullptr) {
+            const bool validLeft = (cur == cmdLine) || std::isspace(static_cast<unsigned char>(cur[-1])) || cur[-1] == '"';
+            const char next = cur[flagLen];
+            const bool validRight = next == '\0' || std::isspace(static_cast<unsigned char>(next)) || next == '"' || next == '=' || next == ':';
+            if (validLeft && validRight) return cur + flagLen;
+            cur += flagLen;
+        }
+        return nullptr;
+    }
+
+    static AppId_t ParseFlagAppId(const char* cmdLine, const char* flag) {
+        const char* after = FindFlagToken(cmdLine, flag);
+        if (!after) return 0;
+        if (*after == '=' || *after == ':') {
+            ++after;
+        } else {
+            while (*after && std::isspace(static_cast<unsigned char>(*after))) ++after;
+        }
+        if (!std::isdigit(static_cast<unsigned char>(*after))) return 0;
+        char* endPtr = nullptr;
+        unsigned long parsed = std::strtoul(after, &endPtr, 10);
+        if (endPtr == after || parsed == 0) return 0;
+        return static_cast<AppId_t>(parsed);
+    }
+
+    static bool TryReadIniFakeAppId(const std::filesystem::path& dir, AppId_t& outFakeAppId) {
+        if (dir.empty()) return false;
+        std::error_code ec;
+        std::filesystem::path iniPath = dir / "OnlineFix.ini";
+        if (!std::filesystem::is_regular_file(iniPath, ec)) return false;
+
+        std::string iniStr = iniPath.string();
+        UINT val = GetPrivateProfileIntA("Main", "FakeAppId", 0, iniStr.c_str());
+        if (val == 0) {
+            val = GetPrivateProfileIntA("OnlineFix", "FakeAppId", 0, iniStr.c_str());
+        }
+        outFakeAppId = val != 0 ? static_cast<AppId_t>(val) : kOnlineFixAppId;
+        return true;
+    }
+
+    static bool DetectOnlineFixFromIni(const char* workingDir, const char* exePath, AppId_t& outFakeAppId) {
+        if (workingDir && workingDir[0] != '\0') {
+            if (TryReadIniFakeAppId(std::filesystem::path(workingDir), outFakeAppId)) return true;
+        }
+        if (exePath && exePath[0] != '\0') {
+            std::filesystem::path exeParent = std::filesystem::path(exePath).parent_path();
+            if (TryReadIniFakeAppId(exeParent, outFakeAppId)) return true;
+        }
+        return false;
+    }
+
+    static void ResetOnlineFixState() {
+        g_OnlineFixRealAppId = 0;
+        g_OnlineFixFakeAppId = kOnlineFixAppId;
+        g_NetworkingSocketsActive = false;
+        g_SuppressAppIdFlip = false;
+        g_OnlineFixGamesPlayedSeen = false;
+    }
 
     // ── SpawnProcess interception ────────────────────────────────────────────
     // CUser_SpawnProcess(pCUser, pExePath, pCommandLine, pWorkingDir,
@@ -28,28 +91,50 @@ namespace {
     // arg1=pCUser, arg2=pExePath, arg3=pCommandLine, arg4=pWorkingDir
     // arg5=pGameID (CGameID*; low 24 bits = AppId)
     static void OnSpawnProcessHit(OSTPlatform::Trap::Context& ctx, const VehCommon::Int3Site& /*site*/) {
+        const char* exePath = VehCommon::GetArg<const char*>(ctx, 2);
+        const char* cmdLine = VehCommon::GetArg<const char*>(ctx, 3);
+        const char* workingDir = VehCommon::GetArg<const char*>(ctx, 4);
         CGameID* pGameID = VehCommon::GetArg<CGameID*>(ctx, 5);
         AppId_t appId = static_cast<AppId_t>(pGameID->AppID(true));
-        const char* cmdLine = VehCommon::GetArg<const char*>(ctx, 3);
 
-        // 每次命中均记录启动参数，用于区分 hook 未触发与启动参数缺失两种情况。
         LOG_MISC_DEBUG("SpawnProcess hit: appid {} cmd=\"{}\"", appId, cmdLine ? cmdLine : "<null>");
 
-        // 只看启动参数，不再要求 appid 在 Lua 名单里：正版玩家加 -onlinefix
-        // 联机同样要生效，解锁名单不该决定联机开关。
-        if (cmdLine && strstr(cmdLine, "-onlinefix"))
-        {
+        if (FindFlagToken(cmdLine, "-noonlinefix")) {
+            if (appId == g_OnlineFixRealAppId || !g_OnlineFixGamesPlayedSeen) {
+                ResetOnlineFixState();
+            }
+            return;
+        }
+
+        const bool hasFlag = FindFlagToken(cmdLine, "-onlinefix") != nullptr;
+        AppId_t iniFakeAppId = kOnlineFixAppId;
+        const bool hasIni = !hasFlag && appId != 0 && DetectOnlineFixFromIni(workingDir, exePath, iniFakeAppId);
+
+        if (hasFlag || hasIni) {
+            AppId_t fakeAppId = ParseFlagAppId(cmdLine, "-fakeappid");
+            if (fakeAppId == 0 && hasFlag) fakeAppId = ParseFlagAppId(cmdLine, "-onlinefix");
+            if (fakeAppId == 0) fakeAppId = hasIni ? iniFakeAppId : kOnlineFixAppId;
+
             g_OnlineFixRealAppId = appId;
+            g_OnlineFixFakeAppId = fakeAppId;
             g_NetworkingSocketsActive = false;
-            // 逐局关闭 appid 翻转：启动期就要读自己 appid 的游戏会卡在黑屏，
-            // 这个调用本身分不出游戏意图，只能交给用户按局指定。
-            g_SuppressAppIdFlip = strstr(cmdLine, "-realappid") != nullptr;
-            pGameID->SetAppID(kOnlineFixAppId);
-            LOG_MISC_INFO("SpawnProcess: appid {} -> {}, realappid={}, cmd=\"{}\"",
-                          appId, kOnlineFixAppId, g_SuppressAppIdFlip, cmdLine);
-        } else {
-            g_OnlineFixRealAppId = 0;
-            g_SuppressAppIdFlip = false;
+            g_OnlineFixGamesPlayedSeen = false;
+            g_SuppressAppIdFlip = FindFlagToken(cmdLine, "-realappid") != nullptr;
+            pGameID->SetAppID(fakeAppId);
+            LOG_MISC_INFO("SpawnProcess: appid {} -> {}, realappid={}, source={}, cmd=\"{}\"",
+                          appId, fakeAppId, g_SuppressAppIdFlip, hasFlag ? "cmdline" : "ini", cmdLine ? cmdLine : "");
+            return;
+        }
+
+        if (g_OnlineFixRealAppId != 0 && appId == g_OnlineFixRealAppId) {
+            pGameID->SetAppID(g_OnlineFixFakeAppId);
+            LOG_MISC_INFO("SpawnProcess: child/relaunch appid {} -> {}, cmd=\"{}\"",
+                          appId, g_OnlineFixFakeAppId, cmdLine ? cmdLine : "");
+            return;
+        }
+
+        if (appId != 0 && !g_OnlineFixGamesPlayedSeen) {
+            ResetOnlineFixState();
         }
     }
 
@@ -60,7 +145,7 @@ namespace {
     // opt-in and gameoverlayrenderer hijacks the XInput stream.
     HOOK_FUNC(OptedInMask, int64,void* pThis, AppId_t appId)
     {
-        if (appId == kOnlineFixAppId && g_OnlineFixRealAppId) {
+        if (g_OnlineFixRealAppId && appId == g_OnlineFixFakeAppId) {
             LOG_MISC_INFO("OptedInMask: appid {} -> {}",appId, g_OnlineFixRealAppId);
             appId = g_OnlineFixRealAppId;
         }
@@ -78,7 +163,7 @@ namespace {
               void* a8, void* a9, unsigned int a10, char a11)
     {
         if (g_OnlineFixRealAppId && pOverlayCGameID
-            && pOverlayCGameID->AppID(true) == kOnlineFixAppId) 
+            && pOverlayCGameID->AppID(true) == g_OnlineFixFakeAppId)
         {
             LOG_MISC_INFO("BuildSpawnEnvBlock: SetAppID in OverlayCGameID {} -> {}",
                           pOverlayCGameID->AppID(true), g_OnlineFixRealAppId);
@@ -160,11 +245,30 @@ namespace Hooks_Misc {
         return g_OnlineFixRealAppId != 0;
     }
 
+    AppId_t GetOnlineFixFakeAppId() {
+        return g_OnlineFixFakeAppId;
+    }
+
+    bool IsOnlineFixFakeAppId(AppId_t appId) {
+        return g_OnlineFixRealAppId != 0 && appId == g_OnlineFixFakeAppId;
+    }
+
+    void OnGamesPlayedUpdated(bool hasFakeAppIdRunning) {
+        if (!g_OnlineFixRealAppId) return;
+        if (hasFakeAppIdRunning) {
+            g_OnlineFixGamesPlayedSeen = true;
+        } else if (g_OnlineFixGamesPlayedSeen) {
+            LOG_MISC_INFO("OnlineFix session ended for appid {}", g_OnlineFixRealAppId);
+            ResetOnlineFixState();
+        }
+    }
+
     void NotifyNetworkingSocketsUsed() {
         if (g_OnlineFixRealAppId && !g_NetworkingSocketsActive) {
             g_NetworkingSocketsActive = true;
-            LOG_MISC_INFO("NetworkingSockets active: GetAppID now reports {}",
-                          g_SuppressAppIdFlip ? "real appid (-realappid)" : "480 for cert match");
+            LOG_MISC_INFO("NetworkingSockets active: GetAppID now reports {} (fake={})",
+                          g_SuppressAppIdFlip ? "real appid (-realappid)" : "fake appid for cert match",
+                          g_OnlineFixFakeAppId);
         }
     }
 
