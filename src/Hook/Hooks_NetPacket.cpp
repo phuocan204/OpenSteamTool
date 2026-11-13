@@ -1221,7 +1221,7 @@ namespace Hooks_NetPacket_RichPresence {
         // Owned games on top let the server's natural broadcast paint the
         // cache; -onlinefix games are already handled by the OnlineFix path.
         AppId_t newTracked = 0;
-        if (topmost != 0 && topmost != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(topmost) && !(Hooks_Misc::IsOnlineFixActive() && topmost == Hooks_Misc::GetOnlineFixRealAppId()) && LuaConfig::HasDepot(topmost))
+        if (topmost != 0 && topmost != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(topmost) && !(Hooks_Misc::IsOnlineFixActive() && topmost == Hooks_Misc::ResolveAppId()) && LuaConfig::HasDepot(topmost))
             newTracked = topmost;
 
         if (topmost == 0) {
@@ -1391,7 +1391,7 @@ namespace Hooks_NetPacket_OnlineFix {
             AppId_t appid = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
 
             if (Hooks_Misc::IsOnlineFixActive()) {
-                AppId_t realAppId = Hooks_Misc::GetOnlineFixRealAppId();
+                AppId_t realAppId = Hooks_Misc::ResolveAppId();
                 AppId_t fakeAppId = Hooks_Misc::GetOnlineFixFakeAppId();
                 if (realAppId != 0 && fakeAppId != 0 && appid == realAppId && realAppId != fakeAppId) {
                     game->set_game_id(fakeAppId);
@@ -1922,7 +1922,7 @@ namespace {
                                          bool rewriteField1AppId)
     {
         if (!Hooks_Misc::IsOnlineFixActive()) return;
-        const AppId_t realAppId = Hooks_Misc::GetOnlineFixRealAppId();
+        const AppId_t realAppId = Hooks_Misc::ResolveAppId();
         const AppId_t fakeAppId = Hooks_Misc::GetOnlineFixFakeAppId();
         if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
 
@@ -1967,7 +1967,7 @@ namespace {
                 g_NeedReplaceSend = SendServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
                 if (!g_SuppressSend && !g_NeedReplaceSend && Hooks_Misc::IsOnlineFixActive()) {
                     RewriteSendRoutingAppId(pHdr, cbHdr,
-                        Hooks_Misc::GetOnlineFixRealAppId(),
+                        Hooks_Misc::ResolveAppId(),
                         Hooks_Misc::GetOnlineFixFakeAppId());
                 }
             }
