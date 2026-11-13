@@ -32,7 +32,9 @@ jobs:
       - name: Build ${{ matrix.config }}
         run: |
           cmake --build build --config ${{ matrix.config }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build --config ${{ matrix.config }} --target app
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Test-Path "build/tools/${{ matrix.config }}/app.exe") {
             Copy-Item "build/tools/${{ matrix.config }}/app.exe" "build/${{ matrix.config }}/app.exe"
           }

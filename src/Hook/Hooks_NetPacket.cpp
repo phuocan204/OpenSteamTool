@@ -1070,7 +1070,8 @@ namespace Hooks_NetPacket_RichPresence {
                                 CMsgClientPersonaState::Friend* entry,
                                 AppId_t appid)
     {
-        // EClientPersonaStateFlag::k_EClientPersonaStateFlagRichPresence
+        constexpr uint32 kStatusFlagStatus = 0x0001;
+        constexpr uint32 kStatusFlagGameExtraInfo = 0x0100;
         constexpr uint32 kStatusFlagRichPresence = 0x1000;
 
         if (appid) {
@@ -1081,7 +1082,7 @@ namespace Hooks_NetPacket_RichPresence {
             if (Hooks_NetPacket_Matchmaking::g_ActiveLobbyAppId == appid &&
                 Hooks_NetPacket_Matchmaking::g_ActiveLobbyId != 0) {
                 entry->set_game_lobby_id(Hooks_NetPacket_Matchmaking::g_ActiveLobbyId);
-            } else {
+            } else if (!entry->has_game_lobby_id()) {
                 entry->clear_game_lobby_id();
             }
             entry->clear_rich_presence();
@@ -1093,9 +1094,9 @@ namespace Hooks_NetPacket_RichPresence {
                     kv->set_key(k);
                     kv->set_value(v);
                 }
-                msg.set_status_flags(msg.status_flags() | kStatusFlagRichPresence);
+                msg.set_status_flags(msg.status_flags() | kStatusFlagStatus | kStatusFlagGameExtraInfo | kStatusFlagRichPresence);
             } else {
-                msg.set_status_flags(msg.status_flags() & ~kStatusFlagRichPresence);
+                msg.set_status_flags((msg.status_flags() | kStatusFlagStatus | kStatusFlagGameExtraInfo) & ~kStatusFlagRichPresence);
             }
         } else {
             entry->clear_game_played_app_id();
@@ -1103,7 +1104,7 @@ namespace Hooks_NetPacket_RichPresence {
             entry->clear_game_name();
             entry->clear_game_lobby_id();
             entry->clear_rich_presence();
-            msg.set_status_flags(msg.status_flags() | kStatusFlagRichPresence);
+            msg.set_status_flags(msg.status_flags() | kStatusFlagStatus | kStatusFlagGameExtraInfo | kStatusFlagRichPresence);
         }
     }
 
@@ -1154,6 +1155,9 @@ namespace Hooks_NetPacket_RichPresence {
     {
         if (appId == 0 || g_LocalSteamId == 0) return;
         if (!BroadcastEnabled()) return;
+        if (g_PlayingAppId == 0 && !Hooks_Misc::IsOnlineFixActive() && LuaConfig::HasDepot(appId)) {
+            g_PlayingAppId = appId;
+        }
         if (g_PlayingAppId != appId) return;
         if (BuildInject(g_PlayingAppId)) g_InjectPending = true;
     }
@@ -1179,13 +1183,15 @@ namespace Hooks_NetPacket_RichPresence {
 
     void TrackSend(const CMsgClientGamesPlayed& msg, const uint8* pHdr, uint32 cbHdr)
     {
-        if (g_LocalSteamId == 0) {
+        if (pHdr && cbHdr > 0) {
             CMsgProtoBufHeader hdr;
-            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_steamid() && hdr.steamid()) {
-                g_LocalSteamId = hdr.steamid();
-                LOG_RICHPRESENCE_DEBUG("Captured local SteamID 0x{:X}", g_LocalSteamId);
-                CloudRedirectHost::SetAccountId(
-                    static_cast<uint32_t>(g_LocalSteamId & 0xFFFFFFFF));
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_steamid() && (hdr.steamid() & 0xFFFFFFFFull) != 0) {
+                if (g_LocalSteamId != hdr.steamid()) {
+                    g_LocalSteamId = hdr.steamid();
+                    LOG_RICHPRESENCE_DEBUG("Captured local SteamID 0x{:X}", g_LocalSteamId);
+                    CloudRedirectHost::SetAccountId(
+                        static_cast<uint32_t>(g_LocalSteamId & 0xFFFFFFFFull));
+                }
             }
         }
 
@@ -1266,27 +1272,51 @@ namespace Hooks_NetPacket_RichPresence {
                 break;
             }
         }
-        if (!selfEntry) return false;
 
-        LOG_RICHPRESENCE_DEBUG(
-            "Recv self PersonaState: status_flags=0x{:X} friends_size={}",
-            msg.status_flags(), msg.friends_size());
+        if (selfEntry) {
+            LOG_RICHPRESENCE_DEBUG(
+                "Recv self PersonaState: status_flags=0x{:X} friends_size={}",
+                msg.status_flags(), msg.friends_size());
 
-        if (cbHdr <= sizeof(g_SelfHdr) && cbBody <= sizeof(g_SelfBody)) {
-            memcpy(g_SelfHdr,  pHdr,  cbHdr);
-            memcpy(g_SelfBody, pBody, cbBody);
-            g_cbSelfHdr      = cbHdr;
-            g_cbSelfBody     = cbBody;
-            g_HaveSelfCached = true;
+            if (cbHdr <= sizeof(g_SelfHdr) && cbBody <= sizeof(g_SelfBody)) {
+                memcpy(g_SelfHdr,  pHdr,  cbHdr);
+                memcpy(g_SelfBody, pBody, cbBody);
+                g_cbSelfHdr      = cbHdr;
+                g_cbSelfBody     = cbBody;
+                g_HaveSelfCached = true;
+            }
         }
 
-        // With display = "none" I only cache the template (so switching
-        // back works) without patching the live server push.
         if (!BroadcastEnabled()) return false;
-
         if (g_PlayingAppId == 0) return false;
 
-        ApplyGameFields(msg, selfEntry, g_PlayingAppId);
+        bool modified = false;
+        if (selfEntry) {
+            ApplyGameFields(msg, selfEntry, g_PlayingAppId);
+            modified = true;
+        }
+
+        if (!Hooks_Misc::IsOnlineFixActive()) {
+            const std::string myGameName = Hooks_Misc::GetGameNameByAppID(g_PlayingAppId);
+            for (int i = 0; i < msg.friends_size(); ++i) {
+                auto* f = msg.mutable_friends(i);
+                if (!f->has_friendid() || f->friendid() == g_LocalSteamId) continue;
+                const AppId_t fAppId = f->has_game_played_app_id()
+                    ? f->game_played_app_id()
+                    : static_cast<AppId_t>(f->gameid() & UINT32_MAX);
+                if (fAppId != kOnlineFixAppId) continue;
+                if (!myGameName.empty() && f->has_game_name() && !f->game_name().empty() &&
+                    f->game_name() != myGameName) {
+                    continue;
+                }
+                f->set_game_played_app_id(g_PlayingAppId);
+                f->set_gameid(static_cast<uint64>(g_PlayingAppId));
+                modified = true;
+            }
+        }
+
+        if (!modified) return false;
+
         g_cbNewBody = static_cast<uint32>(msg.ByteSizeLong());
         if (g_cbNewBody > kMaxBodySize) {
             LOG_RICHPRESENCE_WARN("In-place patch too large ({} bytes)", g_cbNewBody);
@@ -1296,7 +1326,7 @@ namespace Hooks_NetPacket_RichPresence {
             LOG_RICHPRESENCE_WARN("In-place patch SerializeToArray failed");
             return false;
         }
-        LOG_RICHPRESENCE_INFO("Patched live self push with appid {}", g_PlayingAppId);
+        LOG_RICHPRESENCE_INFO("Patched live PersonaState push with appid {}", g_PlayingAppId);
         return true;
     }
 
@@ -1434,22 +1464,15 @@ namespace Hooks_NetPacket_OnlineFix {
             AppId_t trackedId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
             if (trackedId != 0 && trackedId != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(trackedId) && msg.games_played_size() > 0) {
                 std::string name = Hooks_Misc::GetGameNameByAppID(trackedId);
+                auto* topGame = msg.mutable_games_played(msg.games_played_size() - 1);
+                topGame->set_game_id(kOnlineFixAppId);
                 if (!name.empty()) {
-                    auto* topGame = msg.mutable_games_played(msg.games_played_size() - 1);
-                    uint64 shortcutId = FindShortcutGameId();
-                    if (shortcutId) {
-                        topGame->set_game_id(shortcutId);
-                    } else {
-                        topGame->set_game_id(kOnlineFixAppId);
-                    }
                     topGame->set_game_extra_info(name);
-                    // 重写后的栈顶直接清空 owner，模拟非 Steam 游戏上报形态，
-                    // 兼顾服务器广播与出借方库免锁定。
-                    topGame->clear_owner_id();
-                    patched = true;
-                    didBroadcastRewrite = true;
-                    LOG_ONLINEFIX_INFO("RichPresence: appid {} -> name '{}'", trackedId, name);
                 }
+                topGame->clear_owner_id();
+                patched = true;
+                didBroadcastRewrite = true;
+                LOG_ONLINEFIX_INFO("RichPresence: appid {} -> name '{}'", trackedId, name);
             }
         }
 
@@ -1667,9 +1690,9 @@ namespace Hooks_NetPacket_Cloud {
 
         CMsgProtoBufHeader reqHdr;
         if (!reqHdr.ParseFromArray(pHdr, cbHdr)) return false;
-        if (reqHdr.has_steamid() && reqHdr.steamid())
+        if (reqHdr.has_steamid() && (reqHdr.steamid() & 0xFFFFFFFFull) != 0)
             g_localSteamId = reqHdr.steamid();
-        else if (g_localSteamId == 0 && Hooks_NetPacket_RichPresence::g_LocalSteamId != 0)
+        else if (g_localSteamId == 0 && (Hooks_NetPacket_RichPresence::g_LocalSteamId & 0xFFFFFFFFull) != 0)
             g_localSteamId = Hooks_NetPacket_RichPresence::g_LocalSteamId;
 
         const uint32 rawAppId = ExtractAppId(jobName, pBody, cbBody);
@@ -1921,9 +1944,25 @@ namespace {
                                          const uint8* pHdr, uint32 cbHdr,
                                          bool rewriteField1AppId)
     {
-        if (!Hooks_Misc::IsOnlineFixActive()) return;
-        const AppId_t realAppId = Hooks_Misc::ResolveAppId();
-        const AppId_t fakeAppId = Hooks_Misc::GetOnlineFixFakeAppId();
+        AppId_t realAppId = 0;
+        AppId_t fakeAppId = 0;
+        if (Hooks_Misc::IsOnlineFixActive()) {
+            realAppId = Hooks_Misc::ResolveAppId();
+            fakeAppId = Hooks_Misc::GetOnlineFixFakeAppId();
+        } else if (Hooks_NetPacket_RichPresence::BroadcastEnabled()) {
+            realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+            fakeAppId = kOnlineFixAppId;
+            if (realAppId == 0 && pHdr && cbHdr > 0) {
+                CMsgProtoBufHeader hdr;
+                if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_routing_appid()) {
+                    const AppId_t candidate = hdr.routing_appid();
+                    if (candidate != 0 && candidate != kOnlineFixAppId && LuaConfig::HasDepot(candidate)) {
+                        realAppId = candidate;
+                        Hooks_NetPacket_RichPresence::g_PlayingAppId = candidate;
+                    }
+                }
+            }
+        }
         if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
 
         RewriteSendRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId);
@@ -1939,6 +1978,39 @@ namespace {
         }
     }
 
+    void RewriteOnlineFixMmsOrInviteRecv(const uint8* pBody, uint32 cbBody,
+                                         const uint8* pHdr, uint32 cbHdr,
+                                         bool rewriteField1AppId)
+    {
+        if (Hooks_Misc::IsOnlineFixActive()) return;
+        if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return;
+        const AppId_t realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+        const AppId_t fakeAppId = kOnlineFixAppId;
+        if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
+
+        if (pHdr && cbHdr > 0) {
+            CMsgProtoBufHeader hdr;
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_routing_appid() && hdr.routing_appid() == fakeAppId) {
+                hdr.set_routing_appid(realAppId);
+                const uint32 newHdrSize = static_cast<uint32>(hdr.ByteSizeLong());
+                if (newHdrSize <= kMaxHdrSize && hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)) {
+                    g_cbNewHdr = newHdrSize;
+                    g_NeedReplaceHdr = true;
+                }
+            }
+        }
+
+        if (rewriteField1AppId && pBody && cbBody > 0) {
+            std::vector<uint8> rewritten;
+            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, 1, realAppId, rewritten, true, fakeAppId) &&
+                rewritten.size() <= kMaxBodySize) {
+                memcpy(g_NewBody, rewritten.data(), rewritten.size());
+                g_cbNewBody = static_cast<uint32>(rewritten.size());
+                g_NeedReplaceBody = true;
+            }
+        }
+    }
+
     void SendJob(EMsg eMsg, const uint8* pBody, uint32 cbBody,
                  const uint8* pHdr, uint32 cbHdr)
     {
@@ -1949,10 +2021,10 @@ namespace {
 
         if (Hooks_NetPacket_RichPresence::g_LocalSteamId == 0 && pHdr && cbHdr > 0) {
             CMsgProtoBufHeader hdr;
-            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_steamid() && hdr.steamid()) {
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_steamid() && (hdr.steamid() & 0xFFFFFFFFull) != 0) {
                 Hooks_NetPacket_RichPresence::g_LocalSteamId = hdr.steamid();
                 CloudRedirectHost::SetAccountId(
-                    static_cast<uint32_t>(hdr.steamid() & 0xFFFFFFFF));
+                    static_cast<uint32_t>(hdr.steamid() & 0xFFFFFFFFull));
             }
         }
 
@@ -1965,11 +2037,6 @@ namespace {
             CMsgProtoBufHeader hdr;
             if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name()) {
                 g_NeedReplaceSend = SendServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
-                if (!g_SuppressSend && !g_NeedReplaceSend && Hooks_Misc::IsOnlineFixActive()) {
-                    RewriteSendRoutingAppId(pHdr, cbHdr,
-                        Hooks_Misc::ResolveAppId(),
-                        Hooks_Misc::GetOnlineFixFakeAppId());
-                }
             }
             return;
         }
@@ -1978,7 +2045,6 @@ namespace {
             g_NeedReplaceSend = Hooks_NetPacket_AccessToken::HandleSend(pBody, cbBody);
             return;
 
-        case k_EMsgClientGamesPlayedNoDataBlob:       // 715
         case k_EMsgClientGamesPlayed:                 // 742
         case k_EMsgClientGamesPlayedWithDataBlob:     // 5410
             g_NeedReplaceSend = Hooks_NetPacket_OnlineFix::HandleSend(pBody, cbBody, pHdr, cbHdr);
@@ -2142,15 +2208,43 @@ namespace {
             return;
 
         case k_EMsgClientMMSCreateLobbyResponse:
-            Hooks_NetPacket_Matchmaking::HandleCreateLobbyResponse(pBody, cbBody);
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true);
+            Hooks_NetPacket_Matchmaking::HandleCreateLobbyResponse(
+                g_NeedReplaceBody ? g_NewBody : pBody,
+                g_NeedReplaceBody ? g_cbNewBody : cbBody);
             return;
 
         case k_EMsgClientMMSJoinLobbyResponse:
-            Hooks_NetPacket_Matchmaking::HandleJoinLobbyResponse(pBody, cbBody);
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true);
+            Hooks_NetPacket_Matchmaking::HandleJoinLobbyResponse(
+                g_NeedReplaceBody ? g_NewBody : pBody,
+                g_NeedReplaceBody ? g_cbNewBody : cbBody);
             return;
 
         case k_EMsgClientMMSUserJoinedLobby:
-            Hooks_NetPacket_Matchmaking::HandleUserJoinedLobby(pBody, cbBody);
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true);
+            Hooks_NetPacket_Matchmaking::HandleUserJoinedLobby(
+                g_NeedReplaceBody ? g_NewBody : pBody,
+                g_NeedReplaceBody ? g_cbNewBody : cbBody);
+            return;
+
+        case k_EMsgClientMMSLeaveLobbyResponse:
+        case k_EMsgClientMMSGetLobbyListResponse:
+        case k_EMsgClientMMSSetLobbyDataResponse:
+        case k_EMsgClientMMSLobbyData:
+        case k_EMsgClientMMSLobbyChatMsg:
+        case k_EMsgClientMMSSetLobbyOwnerResponse:
+        case k_EMsgClientMMSLobbyGameServerSet:
+        case k_EMsgClientMMSUserLeftLobby:
+        case k_EMsgClientMMSInviteToLobby:
+        case k_EMsgClientMMSGetLobbyStatusResponse:
+        case k_EMsgMMSGetLobbyListResponse:
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true);
+            return;
+
+        case k_EMsgClientRichPresenceInfo:
+        case k_EMsgClientInviteToGame:
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, false);
             return;
 
         case k_EMsgClientPersonaState:                 // 766

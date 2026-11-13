@@ -107,13 +107,17 @@ namespace {
         }
 
         const bool hasFlag = FindFlagToken(cmdLine, "-onlinefix") != nullptr;
-        AppId_t iniFakeAppId = kOnlineFixAppId;
-        const bool hasIni = !hasFlag && appId != 0 && DetectOnlineFixFromIni(workingDir, exePath, iniFakeAppId);
 
-        if (hasFlag || hasIni) {
+        if (hasFlag) {
             AppId_t fakeAppId = ParseFlagAppId(cmdLine, "-fakeappid");
-            if (fakeAppId == 0 && hasFlag) fakeAppId = ParseFlagAppId(cmdLine, "-onlinefix");
-            if (fakeAppId == 0) fakeAppId = hasIni ? iniFakeAppId : kOnlineFixAppId;
+            if (fakeAppId == 0) fakeAppId = ParseFlagAppId(cmdLine, "-onlinefix");
+            if (fakeAppId == 0) {
+                AppId_t iniFakeAppId = kOnlineFixAppId;
+                if (DetectOnlineFixFromIni(workingDir, exePath, iniFakeAppId))
+                    fakeAppId = iniFakeAppId;
+                else
+                    fakeAppId = kOnlineFixAppId;
+            }
 
             g_OnlineFixRealAppId = appId;
             g_OnlineFixFakeAppId = fakeAppId;
@@ -121,8 +125,8 @@ namespace {
             g_OnlineFixGamesPlayedSeen = false;
             g_SuppressAppIdFlip = FindFlagToken(cmdLine, "-realappid") != nullptr;
             pGameID->SetAppID(fakeAppId);
-            LOG_MISC_INFO("SpawnProcess: appid {} -> {}, realappid={}, source={}, cmd=\"{}\"",
-                          appId, fakeAppId, g_SuppressAppIdFlip, hasFlag ? "cmdline" : "ini", cmdLine ? cmdLine : "");
+            LOG_MISC_INFO("SpawnProcess: appid {} -> {}, realappid={}, cmd=\"{}\"",
+                          appId, fakeAppId, g_SuppressAppIdFlip, cmdLine ? cmdLine : "");
             return;
         }
 
