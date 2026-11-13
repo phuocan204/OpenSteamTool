@@ -1454,18 +1454,11 @@ namespace Hooks_NetPacket_OnlineFix {
         }
         Hooks_Misc::OnGamesPlayedUpdated(hasOnlineFixApp);
 
-        // Rich Presence: rewrite topmost unowned game to use the first
-        // available shortcut's game_id so the server broadcasts it as a
-        // non-Steam game. Falls back to 480 if no shortcuts registered.
-        // 这一段排在家庭共享处理之前，优先级更高：用户开了好友播报就按播报走，
-        // 改完 480 之后后面的分支读到的是新值，自然不会再动它。
-        // 没开播报时这里整体跳过，家庭共享 + lua 才会落到专用分支改替代 id。
         if (broadcast && !didBroadcastRewrite) {
             AppId_t trackedId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
             if (trackedId != 0 && trackedId != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(trackedId) && msg.games_played_size() > 0) {
                 std::string name = Hooks_Misc::GetGameNameByAppID(trackedId);
                 auto* topGame = msg.mutable_games_played(msg.games_played_size() - 1);
-                topGame->set_game_id(kOnlineFixAppId);
                 if (!name.empty()) {
                     topGame->set_game_extra_info(name);
                 }
@@ -1476,23 +1469,11 @@ namespace Hooks_NetPacket_OnlineFix {
             }
         }
 
-        // 家庭共享相关的上报处理，按「lua 里有没有」和「Steam 有没有把它当
-        // 借来的」两个条件分成四种情况：
-        //
-        //   自购 + lua      : 走正版路线，报文原样透传（为了补 DLC 才写的 lua）
-        //   家庭共享 + lua  : 改成替代 AppId。服务器只要看到真实 appid 就会按
-        //                     共享许可记账、占用出借方名额；改写后它就认不出来。
-        //                     开了好友播报时这条走不到，前面广播段已经改成 480 了。
-        //   纯 lua 假入库   : 清空归属，服务器查不到这条 AppId 的许可记录，不占名额
-        //   纯家庭共享      : 还原成真实出借方，让客户端和服务器账本对得上，
-        //                     否则倒计时走完会断线；名额按 Steam 规则正常占用
         for (int i = 0; i < msg.games_played_size(); ++i) {
             auto* game = msg.mutable_games_played(i);
             const AppId_t playedAppId = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
             const AccountID_t reported = game->has_owner_id() ? game->owner_id() : 0;
             const AccountID_t lender = Hooks_Package::GetFamilySharedOwner(playedAppId);
-            // inLua 传 true 会把已标记为真拥有的 AppId 排除掉：自购游戏写进
-            // lua 只是为了补 DLC，主游戏本身走正版路线，上报不能动它的报文。
             bool inLua = LuaConfig::HasDepot(playedAppId, true);
 
             if (lender > 1 && !inLua) {
@@ -1503,24 +1484,18 @@ namespace Hooks_NetPacket_OnlineFix {
                                 playedAppId, reported, lender, inLua);
 
             if (lender > 1 && inLua) {
-                // 共享游戏又写了 lua：改成替代 AppId 上报。服务器只要看到真实
-                // appid 就会按共享许可记账、占用出借方名额；换成别的 id 就认不出来。
-                // 这个 AppId 在服务器上不存在，所以既不会播报也不会记录时长。
-                game->set_game_id(kFamilySharedMaskAppId);
-                // 不填 game_extra_info：这个字段会被服务器拿去当播报的游戏名，
-                // 填上就等于告诉好友在玩什么，和「不播报」的目标相反。
-                game->clear_game_extra_info();
+                if (!broadcast) {
+                    game->set_game_id(kFamilySharedMaskAppId);
+                    game->clear_game_extra_info();
+                }
                 game->clear_owner_id();
                 patched = true;
                 LOG_NETPACKET_INFO("FamilySharing: appid {} -> {} (shared+lua, lender {})",
-                                   playedAppId, kFamilySharedMaskAppId, lender);
+                                   playedAppId, broadcast ? playedAppId : kFamilySharedMaskAppId, lender);
                 continue;
             }
 
             if (inLua) {
-                // 纯 lua 假入库：清空归属，服务器查不到这条 AppId 的许可就
-                // 不按共享许可记账。自购场景在这之前已经被 owned 拦掉了，
-                // 走到这里的都是真正靠假许可跑起来的游戏。
                 if (reported != 0) {
                     game->clear_owner_id();
                     patched = true;
@@ -1530,7 +1505,6 @@ namespace Hooks_NetPacket_OnlineFix {
 
             if (lender <= 1 || reported == lender) continue;
 
-            // 只有共享、没写 lua：还原真实出借方
             game->set_owner_id(lender);
             patched = true;
             LOG_NETPACKET_INFO("FamilySharing: Restoring owner_id {} -> {} for game_id {}",
@@ -1944,25 +1918,9 @@ namespace {
                                          const uint8* pHdr, uint32 cbHdr,
                                          bool rewriteField1AppId)
     {
-        AppId_t realAppId = 0;
-        AppId_t fakeAppId = 0;
-        if (Hooks_Misc::IsOnlineFixActive()) {
-            realAppId = Hooks_Misc::ResolveAppId();
-            fakeAppId = Hooks_Misc::GetOnlineFixFakeAppId();
-        } else if (Hooks_NetPacket_RichPresence::BroadcastEnabled()) {
-            realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
-            fakeAppId = kOnlineFixAppId;
-            if (realAppId == 0 && pHdr && cbHdr > 0) {
-                CMsgProtoBufHeader hdr;
-                if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_routing_appid()) {
-                    const AppId_t candidate = hdr.routing_appid();
-                    if (candidate != 0 && candidate != kOnlineFixAppId && LuaConfig::HasDepot(candidate)) {
-                        realAppId = candidate;
-                        Hooks_NetPacket_RichPresence::g_PlayingAppId = candidate;
-                    }
-                }
-            }
-        }
+        if (!Hooks_Misc::IsOnlineFixActive()) return;
+        const AppId_t realAppId = Hooks_Misc::ResolveAppId();
+        const AppId_t fakeAppId = Hooks_Misc::GetOnlineFixFakeAppId();
         if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
 
         RewriteSendRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId);
@@ -1974,39 +1932,6 @@ namespace {
                 memcpy(g_SendNewBody, rewritten.data(), rewritten.size());
                 g_cbSendNewBody = static_cast<uint32>(rewritten.size());
                 g_NeedReplaceSend = true;
-            }
-        }
-    }
-
-    void RewriteOnlineFixMmsOrInviteRecv(const uint8* pBody, uint32 cbBody,
-                                         const uint8* pHdr, uint32 cbHdr,
-                                         bool rewriteField1AppId)
-    {
-        if (Hooks_Misc::IsOnlineFixActive()) return;
-        if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return;
-        const AppId_t realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
-        const AppId_t fakeAppId = kOnlineFixAppId;
-        if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
-
-        if (pHdr && cbHdr > 0) {
-            CMsgProtoBufHeader hdr;
-            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_routing_appid() && hdr.routing_appid() == fakeAppId) {
-                hdr.set_routing_appid(realAppId);
-                const uint32 newHdrSize = static_cast<uint32>(hdr.ByteSizeLong());
-                if (newHdrSize <= kMaxHdrSize && hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)) {
-                    g_cbNewHdr = newHdrSize;
-                    g_NeedReplaceHdr = true;
-                }
-            }
-        }
-
-        if (rewriteField1AppId && pBody && cbBody > 0) {
-            std::vector<uint8> rewritten;
-            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, 1, realAppId, rewritten, true, fakeAppId) &&
-                rewritten.size() <= kMaxBodySize) {
-                memcpy(g_NewBody, rewritten.data(), rewritten.size());
-                g_cbNewBody = static_cast<uint32>(rewritten.size());
-                g_NeedReplaceBody = true;
             }
         }
     }
@@ -2208,43 +2133,15 @@ namespace {
             return;
 
         case k_EMsgClientMMSCreateLobbyResponse:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true);
-            Hooks_NetPacket_Matchmaking::HandleCreateLobbyResponse(
-                g_NeedReplaceBody ? g_NewBody : pBody,
-                g_NeedReplaceBody ? g_cbNewBody : cbBody);
+            Hooks_NetPacket_Matchmaking::HandleCreateLobbyResponse(pBody, cbBody);
             return;
 
         case k_EMsgClientMMSJoinLobbyResponse:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true);
-            Hooks_NetPacket_Matchmaking::HandleJoinLobbyResponse(
-                g_NeedReplaceBody ? g_NewBody : pBody,
-                g_NeedReplaceBody ? g_cbNewBody : cbBody);
+            Hooks_NetPacket_Matchmaking::HandleJoinLobbyResponse(pBody, cbBody);
             return;
 
         case k_EMsgClientMMSUserJoinedLobby:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true);
-            Hooks_NetPacket_Matchmaking::HandleUserJoinedLobby(
-                g_NeedReplaceBody ? g_NewBody : pBody,
-                g_NeedReplaceBody ? g_cbNewBody : cbBody);
-            return;
-
-        case k_EMsgClientMMSLeaveLobbyResponse:
-        case k_EMsgClientMMSGetLobbyListResponse:
-        case k_EMsgClientMMSSetLobbyDataResponse:
-        case k_EMsgClientMMSLobbyData:
-        case k_EMsgClientMMSLobbyChatMsg:
-        case k_EMsgClientMMSSetLobbyOwnerResponse:
-        case k_EMsgClientMMSLobbyGameServerSet:
-        case k_EMsgClientMMSUserLeftLobby:
-        case k_EMsgClientMMSInviteToLobby:
-        case k_EMsgClientMMSGetLobbyStatusResponse:
-        case k_EMsgMMSGetLobbyListResponse:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true);
-            return;
-
-        case k_EMsgClientRichPresenceInfo:
-        case k_EMsgClientInviteToGame:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, false);
+            Hooks_NetPacket_Matchmaking::HandleUserJoinedLobby(pBody, cbBody);
             return;
 
         case k_EMsgClientPersonaState:                 // 766
