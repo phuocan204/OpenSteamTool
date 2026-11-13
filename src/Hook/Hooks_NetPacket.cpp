@@ -549,9 +549,19 @@ namespace Hooks_NetPacket_ETicket {
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_RichPresence {
     extern uint64 g_LocalSteamId;
+    void OnLobbyUpdated(AppId_t appId);
 }
 
 namespace Hooks_NetPacket_Matchmaking {
+
+    static uint32_t g_ActiveLobbyAppId = 0;
+    static uint64_t g_ActiveLobbyId = 0;
+
+    static void ClearLobby()
+    {
+        g_ActiveLobbyAppId = 0;
+        g_ActiveLobbyId = 0;
+    }
 
     struct SharedLobbyData {
         uint32_t sequence;
@@ -581,6 +591,9 @@ namespace Hooks_NetPacket_Matchmaking {
     static void PublishLobbyLink(uint32_t appId, uint64_t lobbyId)
     {
         if (appId == 0 || lobbyId == 0) return;
+        g_ActiveLobbyAppId = appId;
+        g_ActiveLobbyId = lobbyId;
+        Hooks_NetPacket_RichPresence::OnLobbyUpdated(appId);
         uint64_t localId = Hooks_NetPacket_RichPresence::g_LocalSteamId;
         std::string link = std::format("steam://joinlobby/{}/{}/{}", appId, lobbyId, localId);
         if (link == g_LastLobbyLink) return;
@@ -1065,6 +1078,12 @@ namespace Hooks_NetPacket_RichPresence {
             entry->set_gameid(static_cast<uint64>(appid));
             std::string name = Hooks_Misc::GetGameNameByAppID(appid);
             if (!name.empty()) entry->set_game_name(name);
+            if (Hooks_NetPacket_Matchmaking::g_ActiveLobbyAppId == appid &&
+                Hooks_NetPacket_Matchmaking::g_ActiveLobbyId != 0) {
+                entry->set_game_lobby_id(Hooks_NetPacket_Matchmaking::g_ActiveLobbyId);
+            } else {
+                entry->clear_game_lobby_id();
+            }
             entry->clear_rich_presence();
             auto it = g_RPKvsByAppId.find(appid);
             const bool hasKvs = (it != g_RPKvsByAppId.end()) && !it->second.empty();
@@ -1082,6 +1101,7 @@ namespace Hooks_NetPacket_RichPresence {
             entry->clear_game_played_app_id();
             entry->clear_gameid();
             entry->clear_game_name();
+            entry->clear_game_lobby_id();
             entry->clear_rich_presence();
             msg.set_status_flags(msg.status_flags() | kStatusFlagRichPresence);
         }
@@ -1130,6 +1150,14 @@ namespace Hooks_NetPacket_RichPresence {
 
     // Decode outbound CMsgClientRichPresenceUpload into per-AppId KVs
     // and stage a fresh PersonaState inject.
+    void OnLobbyUpdated(AppId_t appId)
+    {
+        if (appId == 0 || g_LocalSteamId == 0) return;
+        if (!BroadcastEnabled()) return;
+        if (g_PlayingAppId != appId) return;
+        if (BuildInject(g_PlayingAppId)) g_InjectPending = true;
+    }
+
     void TrackRPSend(const uint8* pBody, uint32 cbBody)
     {
         if (g_LocalSteamId == 0 || g_PlayingAppId == 0) return;
@@ -1195,6 +1223,10 @@ namespace Hooks_NetPacket_RichPresence {
         AppId_t newTracked = 0;
         if (topmost != 0 && topmost != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(topmost) && !(Hooks_Misc::IsOnlineFixActive() && topmost == Hooks_Misc::GetOnlineFixRealAppId()) && LuaConfig::HasDepot(topmost))
             newTracked = topmost;
+
+        if (topmost == 0) {
+            Hooks_NetPacket_Matchmaking::ClearLobby();
+        }
 
         if (g_PlayingAppId == newTracked) return;
         g_PlayingAppId = newTracked;
@@ -1962,9 +1994,17 @@ namespace {
             RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false);
             return;
 
+        case k_EMsgClientMMSLeaveLobby:                // 6605
+            Hooks_NetPacket_Matchmaking::ClearLobby();
+            if (Hooks_NetPacket_RichPresence::BroadcastEnabled() &&
+                Hooks_NetPacket_RichPresence::g_PlayingAppId != 0) {
+                Hooks_NetPacket_RichPresence::OnLobbyUpdated(Hooks_NetPacket_RichPresence::g_PlayingAppId);
+            }
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, true);
+            return;
+
         case k_EMsgClientMMSCreateLobby:               // 6601
         case k_EMsgClientMMSJoinLobby:                 // 6603
-        case k_EMsgClientMMSLeaveLobby:                // 6605
         case k_EMsgClientMMSGetLobbyList:              // 6607
         case k_EMsgClientMMSSetLobbyData:              // 6609
         case k_EMsgClientMMSGetLobbyData:              // 6611
