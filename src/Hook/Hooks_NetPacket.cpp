@@ -52,7 +52,10 @@ namespace {
     // ── Outgoing (BBuildAndAsyncSendFrame) — same pattern ───────
     uint8  g_SendNewBody[kMaxBodySize];
     uint32 g_cbSendNewBody = 0;
+    uint8  g_SendNewHdr[kMaxHdrSize];
+    uint32 g_cbSendNewHdr = 0;
     bool   g_NeedReplaceSend = false;
+    bool   g_NeedReplaceSendHdr = false;
     bool   g_SuppressSend    = false;   // drop the outbound frame entirely (cloud RPC answered locally)
     uint8  g_SendPacketPool[kPacketPoolSize][kMaxPacketSize];
     int    g_SendPacketPoolIdx = 0;
@@ -1190,7 +1193,7 @@ namespace Hooks_NetPacket_RichPresence {
         // Owned games on top let the server's natural broadcast paint the
         // cache; -onlinefix games are already handled by the OnlineFix path.
         AppId_t newTracked = 0;
-        if (topmost != 0 && topmost != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(topmost) && LuaConfig::HasDepot(topmost))
+        if (topmost != 0 && topmost != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(topmost) && !(Hooks_Misc::IsOnlineFixActive() && topmost == Hooks_Misc::GetOnlineFixRealAppId()) && LuaConfig::HasDepot(topmost))
             newTracked = topmost;
 
         if (g_PlayingAppId == newTracked) return;
@@ -1354,6 +1357,16 @@ namespace Hooks_NetPacket_OnlineFix {
         for (int i = 0; i < msg.games_played_size(); ++i) {
             auto* game = msg.mutable_games_played(i);
             AppId_t appid = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
+
+            if (Hooks_Misc::IsOnlineFixActive()) {
+                AppId_t realAppId = Hooks_Misc::GetOnlineFixRealAppId();
+                AppId_t fakeAppId = Hooks_Misc::GetOnlineFixFakeAppId();
+                if (realAppId != 0 && fakeAppId != 0 && appid == realAppId && realAppId != fakeAppId) {
+                    game->set_game_id(fakeAppId);
+                    appid = fakeAppId;
+                    patched = true;
+                }
+            }
 
             if (Hooks_Misc::IsOnlineFixFakeAppId(appid)) {
                 hasOnlineFixApp = true;
@@ -1558,7 +1571,7 @@ namespace Hooks_NetPacket_Cloud {
         return 1;
     }
 
-    static bool RewriteVarintField(const uint8* d, uint32 size, uint32 target, uint64 newValue, std::vector<uint8>& out) {
+    static bool RewriteVarintField(const uint8* d, uint32 size, uint32 target, uint64 newValue, std::vector<uint8>& out, bool requireMatch = false, uint64 expectedVal = 0) {
         uint32 pos = 0;
         while (pos < size) {
             uint64 tag;
@@ -1569,6 +1582,7 @@ namespace Hooks_NetPacket_Cloud {
                 uint32 valStart = pos;
                 uint64 oldVal = 0;
                 if (!ReadVarint(d, size, pos, oldVal)) return false;
+                if (requireMatch && oldVal != expectedVal) return false;
                 uint32 valEnd = pos;
                 out.clear();
                 out.reserve(size + 10);
@@ -1857,11 +1871,49 @@ namespace {
         return false;
     }
 
+    void RewriteSendRoutingAppId(const uint8* pHdr, uint32 cbHdr, AppId_t realAppId, AppId_t fakeAppId)
+    {
+        if (!pHdr || cbHdr == 0 || realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr)) return;
+        if (!hdr.has_routing_appid() || hdr.routing_appid() != realAppId) return;
+        hdr.set_routing_appid(fakeAppId);
+        const uint32 newHdrSize = static_cast<uint32>(hdr.ByteSizeLong());
+        if (newHdrSize <= kMaxHdrSize && hdr.SerializeToArray(g_SendNewHdr, kMaxHdrSize)) {
+            g_cbSendNewHdr = newHdrSize;
+            g_NeedReplaceSendHdr = true;
+        }
+    }
+
+    void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
+                                         const uint8* pHdr, uint32 cbHdr,
+                                         bool rewriteField1AppId)
+    {
+        if (!Hooks_Misc::IsOnlineFixActive()) return;
+        const AppId_t realAppId = Hooks_Misc::GetOnlineFixRealAppId();
+        const AppId_t fakeAppId = Hooks_Misc::GetOnlineFixFakeAppId();
+        if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
+
+        RewriteSendRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId);
+
+        if (rewriteField1AppId && pBody && cbBody > 0) {
+            std::vector<uint8> rewritten;
+            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, 1, fakeAppId, rewritten, true, realAppId) &&
+                rewritten.size() <= kMaxBodySize) {
+                memcpy(g_SendNewBody, rewritten.data(), rewritten.size());
+                g_cbSendNewBody = static_cast<uint32>(rewritten.size());
+                g_NeedReplaceSend = true;
+            }
+        }
+    }
+
     void SendJob(EMsg eMsg, const uint8* pBody, uint32 cbBody,
                  const uint8* pHdr, uint32 cbHdr)
     {
-        g_NeedReplaceSend = false;
-        g_SuppressSend    = false;
+        g_NeedReplaceSend    = false;
+        g_NeedReplaceSendHdr = false;
+        g_cbSendNewHdr       = 0;
+        g_SuppressSend       = false;
 
         if (Hooks_NetPacket_RichPresence::g_LocalSteamId == 0 && pHdr && cbHdr > 0) {
             CMsgProtoBufHeader hdr;
@@ -1881,6 +1933,11 @@ namespace {
             CMsgProtoBufHeader hdr;
             if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name()) {
                 g_NeedReplaceSend = SendServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
+                if (!g_SuppressSend && !g_NeedReplaceSend && Hooks_Misc::IsOnlineFixActive()) {
+                    RewriteSendRoutingAppId(pHdr, cbHdr,
+                        Hooks_Misc::GetOnlineFixRealAppId(),
+                        Hooks_Misc::GetOnlineFixFakeAppId());
+                }
             }
             return;
         }
@@ -1889,6 +1946,7 @@ namespace {
             g_NeedReplaceSend = Hooks_NetPacket_AccessToken::HandleSend(pBody, cbBody);
             return;
 
+        case k_EMsgClientGamesPlayedNoDataBlob:       // 715
         case k_EMsgClientGamesPlayed:                 // 742
         case k_EMsgClientGamesPlayedWithDataBlob:     // 5410
             g_NeedReplaceSend = Hooks_NetPacket_OnlineFix::HandleSend(pBody, cbBody, pHdr, cbHdr);
@@ -1896,6 +1954,28 @@ namespace {
 
         case k_EMsgClientRichPresenceUpload:           // 7501
             Hooks_NetPacket_RichPresence::TrackRPSend(pBody, cbBody);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false);
+            return;
+
+        case k_EMsgClientRichPresenceRequest:          // 7502
+        case k_EMsgClientInviteToGame:                 // 7005
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false);
+            return;
+
+        case k_EMsgClientMMSCreateLobby:               // 6601
+        case k_EMsgClientMMSJoinLobby:                 // 6603
+        case k_EMsgClientMMSLeaveLobby:                // 6605
+        case k_EMsgClientMMSGetLobbyList:              // 6607
+        case k_EMsgClientMMSSetLobbyData:              // 6609
+        case k_EMsgClientMMSGetLobbyData:              // 6611
+        case k_EMsgClientMMSSendLobbyChatMsg:          // 6613
+        case k_EMsgClientMMSSetLobbyOwner:             // 6615
+        case k_EMsgClientMMSSetLobbyGameServer:        // 6617
+        case k_EMsgClientMMSInviteToLobby:             // 6621
+        case k_EMsgClientMMSSetLobbyLinked:             // 6624
+        case k_EMsgClientMMSGetLobbyStatus:            // 6626
+        case k_EMsgMMSGetLobbyList:                    // 6628
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, true);
             return;
 
         case k_EMsgClientGetUserStats:               // 818
@@ -2078,10 +2158,15 @@ namespace {
                 return true;
             }
 
-            if (g_NeedReplaceSend) {
+            if (g_NeedReplaceSend || g_NeedReplaceSendHdr) {
                 uint32 newSize = 0;
-                uint8* buf = ReplaceSendPacket(pubData, cbHdr, pHdr,
-                                               g_SendNewBody, g_cbSendNewBody, &newSize);
+                uint8* buf = ReplaceSendPacket(
+                    pubData,
+                    g_NeedReplaceSendHdr ? g_cbSendNewHdr : cbHdr,
+                    g_NeedReplaceSendHdr ? g_SendNewHdr : pHdr,
+                    g_NeedReplaceSend ? g_SendNewBody : pBody,
+                    g_NeedReplaceSend ? g_cbSendNewBody : cbBody,
+                    &newSize);
                 result = buf
                     ? oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, buf, newSize)
                     : oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, pubData, cubData);
