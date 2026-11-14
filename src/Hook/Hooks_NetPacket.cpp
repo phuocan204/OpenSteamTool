@@ -1017,6 +1017,8 @@ namespace Hooks_NetPacket_RichPresence {
     // does not conflate KV state.
     std::unordered_map<AppId_t, std::vector<std::pair<std::string, std::string>>> g_RPKvsByAppId;
     std::unordered_map<uint64, AppId_t> g_FriendAppBySteamId;
+    std::unordered_set<uint64> g_FriendOstActiveBySteamId;
+    std::unordered_map<uint64, std::string> g_FriendGameNameBySteamId;
     AppId_t g_LastFriendAppId = 0;
     AppId_t g_LastPlayingAppId = 0;
 
@@ -1035,6 +1037,35 @@ namespace Hooks_NetPacket_RichPresence {
             }
         }
         return 0;
+    }
+
+    bool IsRecipientUsingOstLuaForApp(uint64 friendSteamId, AppId_t appId)
+    {
+        if (friendSteamId == 0 || appId == 0 || !LuaConfig::HasDepot(appId)) return false;
+        auto appIt = g_FriendAppBySteamId.find(friendSteamId);
+        if (appIt != g_FriendAppBySteamId.end() && appIt->second != 0) {
+            return appIt->second == appId;
+        }
+        if (g_FriendOstActiveBySteamId.find(friendSteamId) == g_FriendOstActiveBySteamId.end()) {
+            return false;
+        }
+        auto nameIt = g_FriendGameNameBySteamId.find(friendSteamId);
+        if (nameIt != g_FriendGameNameBySteamId.end() && !nameIt->second.empty()) {
+            const AppId_t resolved = ResolveLuaAppIdByGameName(nameIt->second);
+            if (resolved != 0) {
+                g_FriendAppBySteamId[friendSteamId] = resolved;
+                return resolved == appId;
+            }
+            const std::string targetName = Hooks_Misc::GetGameNameByAppID(appId);
+            if (!targetName.empty()) {
+                if (nameIt->second == targetName) {
+                    g_FriendAppBySteamId[friendSteamId] = appId;
+                    return true;
+                }
+                return false;
+            }
+        }
+        return true;
     }
 
     // With [presence] display = "none" I skip all friend-broadcast patches
@@ -1328,45 +1359,58 @@ namespace Hooks_NetPacket_RichPresence {
             modified = true;
         }
 
-        if (!Hooks_Misc::IsOnlineFixActive()) {
-            const std::string myGameName = g_PlayingAppId != 0
-                ? Hooks_Misc::GetGameNameByAppID(g_PlayingAppId)
-                : std::string();
-            for (int i = 0; i < msg.friends_size(); ++i) {
-                auto* f = msg.mutable_friends(i);
-                if (!f->has_friendid() || f->friendid() == g_LocalSteamId) continue;
-                const AppId_t fAppId = f->has_game_played_app_id()
-                    ? f->game_played_app_id()
-                    : static_cast<AppId_t>(f->gameid() & UINT32_MAX);
-                if (fAppId != kOnlineFixAppId) {
-                    if (f->has_game_played_app_id() || f->has_gameid()) {
-                        g_FriendAppBySteamId.erase(f->friendid());
-                    }
-                    continue;
+        const AppId_t currentLocalAppId = Hooks_Misc::IsOnlineFixActive()
+            ? Hooks_Misc::ResolveAppId()
+            : g_PlayingAppId;
+        const std::string myGameName = currentLocalAppId != 0
+            ? Hooks_Misc::GetGameNameByAppID(currentLocalAppId)
+            : std::string();
+        for (int i = 0; i < msg.friends_size(); ++i) {
+            auto* f = msg.mutable_friends(i);
+            if (!f->has_friendid() || f->friendid() == g_LocalSteamId) continue;
+            const bool hasGameIdField = f->has_game_played_app_id() || f->has_gameid();
+            const AppId_t fAppId = f->has_game_played_app_id()
+                ? f->game_played_app_id()
+                : static_cast<AppId_t>(f->gameid() & UINT32_MAX);
+            if (fAppId != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(fAppId)) {
+                if (hasGameIdField) {
+                    g_FriendAppBySteamId.erase(f->friendid());
+                    g_FriendOstActiveBySteamId.erase(f->friendid());
+                    g_FriendGameNameBySteamId.erase(f->friendid());
                 }
+                continue;
+            }
 
-                AppId_t targetAppId = 0;
-                if (g_PlayingAppId != 0) {
-                    if (!myGameName.empty() && f->has_game_name() && !f->game_name().empty() &&
-                        f->game_name() != myGameName) {
-                        continue;
-                    }
-                    targetAppId = g_PlayingAppId;
-                } else {
-                    if (f->has_game_name() && !f->game_name().empty()) {
-                        targetAppId = ResolveLuaAppIdByGameName(f->game_name());
-                    }
-                    if (targetAppId == 0) {
-                        auto it = g_FriendAppBySteamId.find(f->friendid());
-                        if (it != g_FriendAppBySteamId.end()) {
-                            targetAppId = it->second;
-                        }
-                    }
-                    if (targetAppId == 0) continue;
+            g_FriendOstActiveBySteamId.insert(f->friendid());
+            if (f->has_game_name() && !f->game_name().empty()) {
+                g_FriendGameNameBySteamId[f->friendid()] = f->game_name();
+            }
+
+            AppId_t targetAppId = 0;
+            if (f->has_game_name() && !f->game_name().empty()) {
+                targetAppId = ResolveLuaAppIdByGameName(f->game_name());
+                if (targetAppId == 0 && currentLocalAppId != 0 &&
+                    (myGameName.empty() || f->game_name() == myGameName)) {
+                    targetAppId = currentLocalAppId;
                 }
+            } else if (currentLocalAppId != 0) {
+                auto nameIt = g_FriendGameNameBySteamId.find(f->friendid());
+                if (nameIt == g_FriendGameNameBySteamId.end() || nameIt->second.empty() ||
+                    myGameName.empty() || nameIt->second == myGameName) {
+                    targetAppId = currentLocalAppId;
+                }
+            }
+            if (targetAppId == 0) {
+                auto it = g_FriendAppBySteamId.find(f->friendid());
+                if (it != g_FriendAppBySteamId.end()) {
+                    targetAppId = it->second;
+                }
+            }
+            if (targetAppId == 0) continue;
 
-                g_FriendAppBySteamId[f->friendid()] = targetAppId;
-                g_LastFriendAppId = targetAppId;
+            g_FriendAppBySteamId[f->friendid()] = targetAppId;
+            g_LastFriendAppId = targetAppId;
+            if (!Hooks_Misc::IsOnlineFixActive()) {
                 f->set_game_played_app_id(targetAppId);
                 f->set_gameid(static_cast<uint64>(targetAppId));
                 modified = true;
@@ -2221,6 +2265,54 @@ namespace {
         }
     }
 
+    bool IsIndividualSteamId(uint64 steamId)
+    {
+        return (steamId & 0xFFF0000000000000ULL) == 0x0110000000000000ULL &&
+               (steamId & 0xFFFFFFFFULL) != 0;
+    }
+
+    bool FindSteamIdField(const uint8* pBody, uint32 cbBody, uint32 fieldNum, uint64& out)
+    {
+        if (!pBody || cbBody == 0 || fieldNum == 0) return false;
+        uint64 candidate = 0;
+        if (Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, fieldNum, candidate) &&
+            IsIndividualSteamId(candidate)) {
+            out = candidate;
+            return true;
+        }
+        if (Hooks_NetPacket_Cloud::FindVarintField(pBody, cbBody, fieldNum, candidate) &&
+            IsIndividualSteamId(candidate)) {
+            out = candidate;
+            return true;
+        }
+        return false;
+    }
+
+    uint64 ExtractRecipientSteamId(const uint8* pBody, uint32 cbBody,
+                                   uint32 primaryField, uint32 fallbackField = 0)
+    {
+        uint64 targetId = 0;
+        if (FindSteamIdField(pBody, cbBody, primaryField, targetId)) {
+            if (targetId != Hooks_NetPacket_RichPresence::g_LocalSteamId || fallbackField == 0) {
+                return targetId;
+            }
+        }
+        if (fallbackField != 0 && FindSteamIdField(pBody, cbBody, fallbackField, targetId)) {
+            return targetId;
+        }
+        return targetId;
+    }
+
+    bool ShouldUseOpenSteamToolInvite(const uint8* pBody, uint32 cbBody,
+                                      AppId_t realAppId,
+                                      uint32 primaryField, uint32 fallbackField = 0)
+    {
+        if (primaryField == 0) return true;
+        const uint64 recipientSteamId = ExtractRecipientSteamId(pBody, cbBody, primaryField, fallbackField);
+        if (recipientSteamId == 0) return false;
+        return Hooks_NetPacket_RichPresence::IsRecipientUsingOstLuaForApp(recipientSteamId, realAppId);
+    }
+
     AppId_t ResolveRecvLuaAppId(const uint8* pBody, uint32 cbBody,
                                   uint32 senderSteamIdField = 0, AppId_t hintAppId = 0)
     {
@@ -2230,7 +2322,7 @@ namespace {
         }
         if (realAppId == 0 && senderSteamIdField != 0 && pBody && cbBody > 0) {
             uint64 senderSteamId = 0;
-            if (Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, senderSteamIdField, senderSteamId)) {
+            if (FindSteamIdField(pBody, cbBody, senderSteamIdField, senderSteamId)) {
                 auto it = Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.find(senderSteamId);
                 if (it != Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.end()) {
                     realAppId = it->second;
@@ -2265,25 +2357,15 @@ namespace {
             realAppId = Hooks_NetPacket_RichPresence::g_LastPlayingAppId;
         }
 
+        if (realAppId == 0 || realAppId == kOnlineFixAppId) return false;
+        if (!ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, 1, 2)) return false;
+
         if (hasHdr && hdr.has_jobid_source() && hdr.jobid_source() != 0) {
-            AppId_t jobAppId = realAppId;
-            if (jobAppId == 0 && pBody && cbBody > 0) {
-                uint64 peerId = 0;
-                if (Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, 2, peerId) ||
-                    Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, 1, peerId)) {
-                    auto it = Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.find(peerId);
-                    if (it != Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.end()) {
-                        jobAppId = it->second;
-                    }
-                }
-            }
             if (g_PendingFriendMsgJobs.size() >= 256) {
                 g_PendingFriendMsgJobs.clear();
             }
-            g_PendingFriendMsgJobs[hdr.jobid_source()] = jobAppId;
+            g_PendingFriendMsgJobs[hdr.jobid_source()] = realAppId;
         }
-
-        if (realAppId == 0 || realAppId == kOnlineFixAppId) return false;
 
         RewriteRoutingAppId(pHdr, cbHdr, realAppId, kOnlineFixAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
@@ -2368,7 +2450,9 @@ namespace {
     void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
                                          bool rewriteField1AppId,
-                                         bool rewriteInviteStrings = false)
+                                         bool rewriteInviteStrings = false,
+                                         uint32 targetSteamIdField = 0,
+                                         uint32 fallbackSteamIdField = 0)
     {
         AppId_t realAppId = 0;
         AppId_t fakeAppId = 0;
@@ -2392,6 +2476,10 @@ namespace {
             }
         }
         if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
+        if (targetSteamIdField != 0 &&
+            !ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, targetSteamIdField, fallbackSteamIdField)) {
+            return;
+        }
 
         RewriteRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
@@ -2495,7 +2583,11 @@ namespace {
             return;
 
         case k_EMsgClientInviteToGame:                 // 7005
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false, true);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false, true, 1);
+            return;
+
+        case k_EMsgClientMMSInviteToLobby:
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, true, false, 3);
             return;
 
         case k_EMsgClientMMSLeaveLobby:                // 6605
@@ -2515,7 +2607,6 @@ namespace {
         case k_EMsgClientMMSSendLobbyChatMsg:          // 6613
         case k_EMsgClientMMSSetLobbyOwner:             // 6615
         case k_EMsgClientMMSSetLobbyGameServer:        // 6617
-        case k_EMsgClientMMSInviteToLobby:             // 6621
         case k_EMsgClientMMSSetLobbyLinked:             // 6624
         case k_EMsgClientMMSGetLobbyStatus:            // 6626
         case k_EMsgMMSGetLobbyList:                    // 6628
