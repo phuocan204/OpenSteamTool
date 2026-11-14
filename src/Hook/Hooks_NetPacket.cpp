@@ -2020,7 +2020,7 @@ namespace {
     void* g_LastSendObject = nullptr;
     bool g_SuppressRecv = false;
 
-    struct PendingJoinLobbyRequest {
+    struct PendingMmsRequest {
         uint64 lobbyId = 0;
         AppId_t realAppId = 0;
         AppId_t sentAppId = 0;
@@ -2028,7 +2028,8 @@ namespace {
         std::vector<uint8> body;
         bool retried = false;
     };
-    PendingJoinLobbyRequest g_LastJoinLobbyReq;
+    PendingMmsRequest g_LastCreateLobbyReq;
+    PendingMmsRequest g_LastJoinLobbyReq;
 
     void WriteVarint(std::vector<uint8>& out, uint64 v)
     {
@@ -2617,12 +2618,12 @@ namespace {
         return 0;
     }
 
-    bool RetryJoinLobbyWithAppId(AppId_t targetAppId)
+    bool RetryMmsWithAppId(EMsg eMsg, PendingMmsRequest& req, AppId_t targetAppId)
     {
         if (!g_LastSendObject || !g_SendFrameFn || targetAppId == 0) return false;
-        if (g_LastJoinLobbyReq.lobbyId == 0 || g_LastJoinLobbyReq.body.empty()) return false;
+        if (req.body.empty()) return false;
 
-        std::vector<uint8> newHdrBytes = g_LastJoinLobbyReq.hdr;
+        std::vector<uint8> newHdrBytes = req.hdr;
         if (!newHdrBytes.empty()) {
             CMsgProtoBufHeader hdr;
             if (hdr.ParseFromArray(newHdrBytes.data(), static_cast<int>(newHdrBytes.size()))) {
@@ -2637,10 +2638,10 @@ namespace {
 
         std::vector<uint8> newBodyBytes;
         if (!Hooks_NetPacket_Cloud::RewriteVarintField(
-                g_LastJoinLobbyReq.body.data(),
-                static_cast<uint32>(g_LastJoinLobbyReq.body.size()),
+                req.body.data(),
+                static_cast<uint32>(req.body.size()),
                 1, targetAppId, newBodyBytes)) {
-            newBodyBytes = g_LastJoinLobbyReq.body;
+            newBodyBytes = req.body;
         }
 
         const uint32 totalSize = static_cast<uint32>(sizeof(MsgHdr) + newHdrBytes.size() + newBodyBytes.size());
@@ -2649,7 +2650,7 @@ namespace {
         uint8* buf = g_SendPacketPool[g_SendPacketPoolIdx];
         g_SendPacketPoolIdx = (g_SendPacketPoolIdx + 1) % kPacketPoolSize;
         MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
-        out->eMsg = static_cast<EMsg>(static_cast<uint32>(k_EMsgClientMMSJoinLobby) | kMsgHdrProtoFlag);
+        out->eMsg = static_cast<EMsg>(static_cast<uint32>(eMsg) | kMsgHdrProtoFlag);
         out->headerLength = static_cast<uint32>(newHdrBytes.size());
         if (!newHdrBytes.empty()) {
             memcpy(buf + sizeof(MsgHdr), newHdrBytes.data(), newHdrBytes.size());
@@ -2658,9 +2659,11 @@ namespace {
             memcpy(buf + sizeof(MsgHdr) + newHdrBytes.size(), newBodyBytes.data(), newBodyBytes.size());
         }
 
-        g_LastJoinLobbyReq.sentAppId = targetAppId;
-        g_LastJoinLobbyReq.retried = true;
-        Hooks_NetPacket_RichPresence::TrackLobbyAppId(g_LastJoinLobbyReq.lobbyId, targetAppId);
+        req.sentAppId = targetAppId;
+        req.retried = true;
+        if (req.lobbyId != 0) {
+            Hooks_NetPacket_RichPresence::TrackLobbyAppId(req.lobbyId, targetAppId);
+        }
         return g_SendFrameFn(g_LastSendObject, k_eWebSocketOpCode_Binary, buf, totalSize);
     }
 
@@ -2671,7 +2674,9 @@ namespace {
                                          uint32 targetSteamIdField = 0,
                                          uint32 fallbackSteamIdField = 0,
                                          bool checkLobbyField2 = false,
-                                         bool isJoinLobby = false)
+                                         bool isJoinLobby = false,
+                                         bool keepNativeMms = false,
+                                         bool isCreateLobby = false)
     {
         AppId_t realAppId = 0;
         AppId_t fakeAppId = 0;
@@ -2703,7 +2708,9 @@ namespace {
 
         bool shouldRewriteToFake = true;
         if (!Hooks_Misc::IsOnlineFixActive()) {
-            if (checkLobbyField2 && lobbyId != 0) {
+            if (keepNativeMms) {
+                shouldRewriteToFake = false;
+            } else if (checkLobbyField2 && lobbyId != 0) {
                 AppId_t trackedLobbyAppId = Hooks_NetPacket_RichPresence::GetTrackedLobbyAppId(lobbyId);
                 if (trackedLobbyAppId == 0 &&
                     Hooks_NetPacket_Matchmaking::g_ActiveLobbyId == lobbyId &&
@@ -2712,12 +2719,21 @@ namespace {
                 }
                 if (trackedLobbyAppId != 0) {
                     shouldRewriteToFake = (trackedLobbyAppId == fakeAppId || Hooks_Misc::IsOnlineFixFakeAppId(trackedLobbyAppId));
-                } else if (targetSteamIdField != 0) {
-                    shouldRewriteToFake = ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, targetSteamIdField, fallbackSteamIdField);
+                } else {
+                    shouldRewriteToFake = false;
                 }
             } else if (targetSteamIdField != 0) {
                 shouldRewriteToFake = ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, targetSteamIdField, fallbackSteamIdField);
             }
+        }
+
+        if (isCreateLobby && pBody && cbBody > 0) {
+            g_LastCreateLobbyReq.lobbyId = 0;
+            g_LastCreateLobbyReq.realAppId = realAppId;
+            g_LastCreateLobbyReq.sentAppId = shouldRewriteToFake ? fakeAppId : realAppId;
+            g_LastCreateLobbyReq.hdr.assign(pHdr ? pHdr : reinterpret_cast<const uint8*>(""), pHdr ? pHdr + cbHdr : reinterpret_cast<const uint8*>(""));
+            g_LastCreateLobbyReq.body.assign(pBody, pBody + cbBody);
+            g_LastCreateLobbyReq.retried = false;
         }
 
         if (isJoinLobby && lobbyId != 0 && pBody && cbBody > 0) {
@@ -2885,9 +2901,12 @@ namespace {
             return;
 
         case k_EMsgClientMMSCreateLobby:               // 6601
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, true, false, 0, 0, false, false, true, true);
+            return;
+
         case k_EMsgClientMMSGetLobbyList:              // 6607
         case k_EMsgMMSGetLobbyList:                    // 6628
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, true);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, true, false, 0, 0, false, false, true, false);
             return;
 
         case k_EMsgClientGetUserStats:               // 818
@@ -3046,6 +3065,23 @@ namespace {
 
         case k_EMsgClientMMSCreateLobbyResponse: {
             const AppId_t rawMmsAppId = ExtractRawMmsAppId(pBody, cbBody, pHdr, cbHdr);
+            if (!Hooks_Misc::IsOnlineFixActive()) {
+                CMsgClientMMSCreateLobbyResponse resp;
+                if (resp.ParseFromArray(pBody, cbBody) &&
+                    resp.has_eresult() &&
+                    resp.eresult() != 1 &&
+                    !g_LastCreateLobbyReq.retried &&
+                    g_LastCreateLobbyReq.realAppId != 0) {
+                    const AppId_t altAppId = (g_LastCreateLobbyReq.sentAppId == kOnlineFixAppId)
+                        ? g_LastCreateLobbyReq.realAppId
+                        : kOnlineFixAppId;
+                    if (altAppId != 0 && altAppId != g_LastCreateLobbyReq.sentAppId &&
+                        RetryMmsWithAppId(k_EMsgClientMMSCreateLobby, g_LastCreateLobbyReq, altAppId)) {
+                        g_SuppressRecv = true;
+                        return;
+                    }
+                }
+            }
             RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true, 0, false, true);
             Hooks_NetPacket_Matchmaking::HandleCreateLobbyResponse(
                 g_NeedReplaceBody ? g_NewBody : pBody,
@@ -3070,7 +3106,7 @@ namespace {
                             ? g_LastJoinLobbyReq.realAppId
                             : kOnlineFixAppId;
                         if (altAppId != 0 && altAppId != g_LastJoinLobbyReq.sentAppId &&
-                            RetryJoinLobbyWithAppId(altAppId)) {
+                            RetryMmsWithAppId(k_EMsgClientMMSJoinLobby, g_LastJoinLobbyReq, altAppId)) {
                             g_SuppressRecv = true;
                             return;
                         }
