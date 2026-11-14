@@ -1030,12 +1030,14 @@ namespace Hooks_NetPacket_RichPresence {
     std::unordered_set<uint64> g_FriendOstActiveBySteamId;
     std::unordered_map<uint64, std::string> g_FriendGameNameBySteamId;
     std::unordered_map<uint64, AppId_t> g_LobbyAppIdByLobbyId;
+    std::mutex g_LobbyMapMutex;
     AppId_t g_LastFriendAppId = 0;
     AppId_t g_LastPlayingAppId = 0;
 
     void TrackLobbyAppId(uint64 lobbyId, AppId_t appId)
     {
         if (lobbyId == 0 || appId == 0) return;
+        std::lock_guard<std::mutex> lock(g_LobbyMapMutex);
         if (g_LobbyAppIdByLobbyId.size() >= 1024) {
             g_LobbyAppIdByLobbyId.clear();
         }
@@ -1045,6 +1047,7 @@ namespace Hooks_NetPacket_RichPresence {
     AppId_t GetTrackedLobbyAppId(uint64 lobbyId)
     {
         if (lobbyId == 0) return 0;
+        std::lock_guard<std::mutex> lock(g_LobbyMapMutex);
         auto it = g_LobbyAppIdByLobbyId.find(lobbyId);
         return it != g_LobbyAppIdByLobbyId.end() ? it->second : 0;
     }
@@ -2352,8 +2355,8 @@ namespace {
     {
         static constexpr std::string_view kJoinPrefix = "steam://joinlobby/";
         static constexpr std::string_view kConnectPrefix = "+connect_lobby";
+        static constexpr std::string_view kLobbyIdAttr = "lobbyid=";
         static constexpr std::string_view kLobbyAttr = "lobby=";
-        static constexpr std::string_view kLobbyEscAttr = "lobby=\\\"";
 
         for (size_t i = 0; i < text.size(); ++i) {
             if (StartsWithCaseInsensitive(text, i, kJoinPrefix.data(), kJoinPrefix.size())) {
@@ -2389,9 +2392,12 @@ namespace {
                     Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedLobbyId, defaultAppId);
                 }
             } else if (defaultAppId != 0 &&
-                       (StartsWithCaseInsensitive(text, i, kLobbyEscAttr.data(), kLobbyEscAttr.size()) ||
+                       (StartsWithCaseInsensitive(text, i, kLobbyIdAttr.data(), kLobbyIdAttr.size()) ||
                         StartsWithCaseInsensitive(text, i, kLobbyAttr.data(), kLobbyAttr.size()))) {
-                size_t p = i + kLobbyAttr.size();
+                const size_t keyLen = StartsWithCaseInsensitive(text, i, kLobbyIdAttr.data(), kLobbyIdAttr.size())
+                    ? kLobbyIdAttr.size()
+                    : kLobbyAttr.size();
+                size_t p = i + keyLen;
                 while (p < text.size() && (text[p] == ' ' || text[p] == '\t' || text[p] == '\\' || text[p] == '"' || text[p] == '\'')) ++p;
                 uint64 parsedLobbyId = 0;
                 size_t lStart = p;
@@ -3255,7 +3261,14 @@ namespace {
             g_ResizedInPlace = false;
             RecvJob(eMsg, pBody, cbBody, pHdr, cbHdr);
             if (g_SuppressRecv) {
-                return nullptr;
+                uint8* buf = g_RecvPacketPool[g_RecvPacketPoolIdx];
+                g_RecvPacketPoolIdx = (g_RecvPacketPoolIdx + 1) % kPacketPoolSize;
+                MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
+                out->eMsg = static_cast<EMsg>(static_cast<uint32>(k_EMsgMulti) | kMsgHdrProtoFlag);
+                out->headerLength = 0;
+                SetPktData(pPacket, buf);
+                SetPktSize(pPacket, sizeof(MsgHdr));
+                return oRecvPkt(pThis, pPacket);
             }
 
             if (g_ResizedInPlace && g_NeedReplaceHdr) {
