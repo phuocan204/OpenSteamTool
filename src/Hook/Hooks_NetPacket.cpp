@@ -1016,6 +1016,7 @@ namespace Hooks_NetPacket_RichPresence {
     // CMsgClientRichPresenceUpload.  Per-AppId so a multi-game stack
     // does not conflate KV state.
     std::unordered_map<AppId_t, std::vector<std::pair<std::string, std::string>>> g_RPKvsByAppId;
+    std::unordered_map<uint64, AppId_t> g_FriendAppBySteamId;
     AppId_t g_LastFriendAppId = 0;
 
     static AppId_t ResolveLuaAppIdByGameName(const std::string& gameName)
@@ -1100,7 +1101,7 @@ namespace Hooks_NetPacket_RichPresence {
             if (Hooks_NetPacket_Matchmaking::g_ActiveLobbyAppId == appid &&
                 Hooks_NetPacket_Matchmaking::g_ActiveLobbyId != 0) {
                 entry->set_game_lobby_id(Hooks_NetPacket_Matchmaking::g_ActiveLobbyId);
-            } else if (!entry->has_game_lobby_id()) {
+            } else if (!entry->has_game_lobby_id() || Hooks_NetPacket_Matchmaking::g_ActiveLobbyId == 0) {
                 entry->clear_game_lobby_id();
             }
             entry->clear_rich_presence();
@@ -1180,9 +1181,19 @@ namespace Hooks_NetPacket_RichPresence {
         if (BuildInject(g_PlayingAppId)) g_InjectPending = true;
     }
 
-    void TrackRPSend(const uint8* pBody, uint32 cbBody)
+    void TrackRPSend(const uint8* pBody, uint32 cbBody, const uint8* pHdr, uint32 cbHdr)
     {
-        if (g_LocalSteamId == 0 || g_PlayingAppId == 0) return;
+        if (g_LocalSteamId == 0) return;
+        if (g_PlayingAppId == 0 && !Hooks_Misc::IsOnlineFixActive() && pHdr && cbHdr > 0) {
+            CMsgProtoBufHeader hdr;
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_routing_appid()) {
+                const AppId_t candidate = hdr.routing_appid();
+                if (candidate != 0 && candidate != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(candidate) && LuaConfig::HasDepot(candidate)) {
+                    g_PlayingAppId = candidate;
+                }
+            }
+        }
+        if (g_PlayingAppId == 0) return;
 
         CMsgClientRichPresenceUpload up;
         if (!up.ParseFromArray(pBody, cbBody)) return;
@@ -1323,7 +1334,12 @@ namespace Hooks_NetPacket_RichPresence {
                 const AppId_t fAppId = f->has_game_played_app_id()
                     ? f->game_played_app_id()
                     : static_cast<AppId_t>(f->gameid() & UINT32_MAX);
-                if (fAppId != kOnlineFixAppId) continue;
+                if (fAppId != kOnlineFixAppId) {
+                    if (f->has_game_played_app_id() || f->has_gameid()) {
+                        g_FriendAppBySteamId.erase(f->friendid());
+                    }
+                    continue;
+                }
 
                 AppId_t targetAppId = 0;
                 if (g_PlayingAppId != 0) {
@@ -1333,11 +1349,19 @@ namespace Hooks_NetPacket_RichPresence {
                     }
                     targetAppId = g_PlayingAppId;
                 } else {
-                    if (!f->has_game_name() || f->game_name().empty()) continue;
-                    targetAppId = ResolveLuaAppIdByGameName(f->game_name());
+                    if (f->has_game_name() && !f->game_name().empty()) {
+                        targetAppId = ResolveLuaAppIdByGameName(f->game_name());
+                    }
+                    if (targetAppId == 0) {
+                        auto it = g_FriendAppBySteamId.find(f->friendid());
+                        if (it != g_FriendAppBySteamId.end()) {
+                            targetAppId = it->second;
+                        }
+                    }
                     if (targetAppId == 0) continue;
                 }
 
+                g_FriendAppBySteamId[f->friendid()] = targetAppId;
                 g_LastFriendAppId = targetAppId;
                 f->set_game_played_app_id(targetAppId);
                 f->set_gameid(static_cast<uint64>(targetAppId));
@@ -1599,16 +1623,21 @@ namespace Hooks_NetPacket_Cloud {
         return false;
     }
 
-    static bool FindVarintField(const uint8* d, uint32 size, uint32 target, uint64& out) {
+    static bool FindTopLevelField(const uint8* d, uint32 size, uint32 target, uint32 targetWireType, uint64& out) {
         uint32 pos = 0;
         while (pos < size) {
             uint64 tag;
             if (!ReadVarint(d, size, pos, tag)) return false;
-            const uint32 field   = static_cast<uint32>(tag >> 3);
+            const uint32 field = static_cast<uint32>(tag >> 3);
             const uint32 wireType = static_cast<uint32>(tag & 7);
-            if (field == target && wireType == 0)
-                return ReadVarint(d, size, pos, out);
-
+            if (field == target && wireType == targetWireType) {
+                if (targetWireType == 0) return ReadVarint(d, size, pos, out);
+                if (targetWireType == 1) {
+                    if (pos + 8 > size) return false;
+                    memcpy(&out, d + pos, sizeof(out));
+                    return true;
+                }
+            }
             switch (wireType) {
             case 0: { uint64 tmp; if (!ReadVarint(d, size, pos, tmp)) return false; break; }
             case 1: if (pos + 8 > size) return false; pos += 8; break;
@@ -1620,10 +1649,18 @@ namespace Hooks_NetPacket_Cloud {
                 pos += static_cast<uint32>(len);
                 break;
             }
-            default: return false;   // groups (3/4) — bail
+            default: return false;
             }
         }
         return false;
+    }
+
+    static bool FindVarintField(const uint8* d, uint32 size, uint32 target, uint64& out) {
+        return FindTopLevelField(d, size, target, 0, out);
+    }
+
+    static bool FindFixed64Field(const uint8* d, uint32 size, uint32 target, uint64& out) {
+        return FindTopLevelField(d, size, target, 1, out);
     }
 
     static uint32 GetAppIdFieldNum(const char* jobName) {
@@ -1946,6 +1983,15 @@ namespace {
         }
     }
 
+    static AppId_t TryTrackLuaAppId(AppId_t candidate)
+    {
+        if (candidate != 0 && candidate != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(candidate) && LuaConfig::HasDepot(candidate)) {
+            Hooks_NetPacket_RichPresence::g_PlayingAppId = candidate;
+            return candidate;
+        }
+        return 0;
+    }
+
     void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
                                          bool rewriteField1AppId)
@@ -1961,11 +2007,13 @@ namespace {
             if (realAppId == 0 && pHdr && cbHdr > 0) {
                 CMsgProtoBufHeader hdr;
                 if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_routing_appid()) {
-                    const AppId_t candidate = hdr.routing_appid();
-                    if (candidate != 0 && candidate != kOnlineFixAppId && LuaConfig::HasDepot(candidate)) {
-                        realAppId = candidate;
-                        Hooks_NetPacket_RichPresence::g_PlayingAppId = candidate;
-                    }
+                    realAppId = TryTrackLuaAppId(hdr.routing_appid());
+                }
+            }
+            if (realAppId == 0 && rewriteField1AppId && pBody && cbBody > 0) {
+                uint64 candidate64 = 0;
+                if (Hooks_NetPacket_Cloud::FindVarintField(pBody, cbBody, 1, candidate64)) {
+                    realAppId = TryTrackLuaAppId(static_cast<AppId_t>(candidate64));
                 }
             }
         }
@@ -1986,12 +2034,22 @@ namespace {
 
     void RewriteOnlineFixMmsOrInviteRecv(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
-                                         bool rewriteField1AppId)
+                                         bool rewriteField1AppId,
+                                         uint32 senderSteamIdField = 0)
     {
         if (Hooks_Misc::IsOnlineFixActive()) return;
         if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return;
 
         AppId_t realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+        if (realAppId == 0 && senderSteamIdField != 0 && pBody && cbBody > 0) {
+            uint64 senderSteamId = 0;
+            if (Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, senderSteamIdField, senderSteamId)) {
+                auto it = Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.find(senderSteamId);
+                if (it != Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.end()) {
+                    realAppId = it->second;
+                }
+            }
+        }
         if (realAppId == 0) {
             realAppId = Hooks_NetPacket_RichPresence::g_LastFriendAppId;
         }
@@ -2061,7 +2119,7 @@ namespace {
             return;
 
         case k_EMsgClientRichPresenceUpload:           // 7501
-            Hooks_NetPacket_RichPresence::TrackRPSend(pBody, cbBody);
+            Hooks_NetPacket_RichPresence::TrackRPSend(pBody, cbBody, pHdr, cbHdr);
             RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false);
             return;
 
@@ -2262,8 +2320,11 @@ namespace {
             return;
 
         case k_EMsgClientRichPresenceInfo:
-        case k_EMsgClientInviteToGame:
             RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, false);
+            return;
+
+        case k_EMsgClientInviteToGame:
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, false, 2);
             return;
 
         case k_EMsgClientPersonaState:                 // 766
