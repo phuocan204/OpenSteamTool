@@ -2372,6 +2372,12 @@ namespace {
         return false;
     }
 
+    void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
+                                         const uint8* pHdr, uint32 cbHdr,
+                                         uint32 appIdField,
+                                         bool rewriteInviteStrings = false,
+                                         uint32 targetSteamIdField = 0);
+
     bool SendServiceJob(const char* targetJobName,
                         const uint8* pBody, uint32 cbBody,
                         const uint8* pHdr, uint32 cbHdr)
@@ -2417,8 +2423,8 @@ namespace {
     void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
                                          uint32 appIdField,
-                                         bool rewriteInviteStrings = false,
-                                         uint32 targetSteamIdField = 0)
+                                         bool rewriteInviteStrings,
+                                         uint32 targetSteamIdField)
     {
         if (!ShouldBridgeInviteForTarget(pBody, cbBody, targetSteamIdField)) return;
         AppId_t realAppId = 0;
