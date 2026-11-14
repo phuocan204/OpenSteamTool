@@ -258,7 +258,12 @@ namespace Hooks_Misc {
     }
 
     void OnGamesPlayedUpdated(bool hasFakeAppIdRunning) {
-        if (!g_OnlineFixRealAppId) return;
+        if (!g_OnlineFixRealAppId) {
+            if (!hasFakeAppIdRunning) {
+                g_NetworkingSocketsActive = false;
+            }
+            return;
+        }
         if (hasFakeAppIdRunning) {
             g_OnlineFixGamesPlayedSeen = true;
         } else if (g_OnlineFixGamesPlayedSeen) {
@@ -268,7 +273,7 @@ namespace Hooks_Misc {
     }
 
     void NotifyNetworkingSocketsUsed() {
-        if (g_OnlineFixRealAppId && !g_NetworkingSocketsActive) {
+        if (!g_NetworkingSocketsActive) {
             g_NetworkingSocketsActive = true;
             LOG_MISC_INFO("NetworkingSockets active: GetAppID now reports {} (fake={})",
                           g_SuppressAppIdFlip ? "real appid (-realappid)" : "fake appid for cert match",
@@ -277,12 +282,8 @@ namespace Hooks_Misc {
     }
 
     bool ShouldReportOnlineFixAppId() {
-        // 翻转的用途是让 P2P socket 的 appid 与 480 会话证书对上，部分游戏靠它联机。
-        // 但它一旦触发，本进程余下生命周期里每次询问都答 480；另一些游戏在启动期
-        // 问同一句话拿到 480 就会卡死或黑屏。两侧都有游戏需要，而这个调用本身
-        // 分不出对方是哪一类，于是用 -realappid 逐局退出。
         if (g_SuppressAppIdFlip) return false;
-        return g_OnlineFixRealAppId != 0 && g_NetworkingSocketsActive;
+        return g_NetworkingSocketsActive;
     }
     
     bool EnsureBufferCapacity(CUtlBuffer* pWrite, uint32 newCapacity,bool updatePut)

@@ -590,6 +590,10 @@ namespace Hooks_NetPacket_Matchmaking {
 
     static void PublishLobbyLink(uint32_t appId, uint64_t lobbyId)
     {
+        if (Hooks_Misc::IsOnlineFixActive() && appId == Hooks_Misc::GetOnlineFixFakeAppId()) {
+            const AppId_t resolved = Hooks_Misc::ResolveAppId();
+            if (resolved != 0) appId = resolved;
+        }
         if (appId == 0 || lobbyId == 0) return;
         g_ActiveLobbyAppId = appId;
         g_ActiveLobbyId = lobbyId;
@@ -1323,54 +1327,55 @@ namespace Hooks_NetPacket_RichPresence {
         if (!BroadcastEnabled()) return false;
 
         bool modified = false;
-        if (selfEntry && g_PlayingAppId != 0) {
-            ApplyGameFields(msg, selfEntry, g_PlayingAppId);
+        const AppId_t activeSelfAppId = g_PlayingAppId != 0
+            ? g_PlayingAppId
+            : (Hooks_Misc::IsOnlineFixActive() ? Hooks_Misc::ResolveAppId() : 0);
+        if (selfEntry && activeSelfAppId != 0) {
+            ApplyGameFields(msg, selfEntry, activeSelfAppId);
             modified = true;
         }
 
-        if (!Hooks_Misc::IsOnlineFixActive()) {
-            const std::string myGameName = g_PlayingAppId != 0
-                ? Hooks_Misc::GetGameNameByAppID(g_PlayingAppId)
-                : std::string();
-            for (int i = 0; i < msg.friends_size(); ++i) {
-                auto* f = msg.mutable_friends(i);
-                if (!f->has_friendid() || f->friendid() == g_LocalSteamId) continue;
-                const AppId_t fAppId = f->has_game_played_app_id()
-                    ? f->game_played_app_id()
-                    : static_cast<AppId_t>(f->gameid() & UINT32_MAX);
-                if (fAppId != kOnlineFixAppId) {
-                    if (f->has_game_played_app_id() || f->has_gameid()) {
-                        g_FriendAppBySteamId.erase(f->friendid());
-                    }
+        const std::string myGameName = activeSelfAppId != 0
+            ? Hooks_Misc::GetGameNameByAppID(activeSelfAppId)
+            : std::string();
+        for (int i = 0; i < msg.friends_size(); ++i) {
+            auto* f = msg.mutable_friends(i);
+            if (!f->has_friendid() || f->friendid() == g_LocalSteamId) continue;
+            const AppId_t fAppId = f->has_game_played_app_id()
+                ? f->game_played_app_id()
+                : static_cast<AppId_t>(f->gameid() & UINT32_MAX);
+            if (fAppId != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(fAppId)) {
+                if (f->has_game_played_app_id() || f->has_gameid()) {
+                    g_FriendAppBySteamId.erase(f->friendid());
+                }
+                continue;
+            }
+
+            AppId_t targetAppId = 0;
+            if (activeSelfAppId != 0) {
+                if (!myGameName.empty() && f->has_game_name() && !f->game_name().empty() &&
+                    f->game_name() != myGameName) {
                     continue;
                 }
-
-                AppId_t targetAppId = 0;
-                if (g_PlayingAppId != 0) {
-                    if (!myGameName.empty() && f->has_game_name() && !f->game_name().empty() &&
-                        f->game_name() != myGameName) {
-                        continue;
-                    }
-                    targetAppId = g_PlayingAppId;
-                } else {
-                    if (f->has_game_name() && !f->game_name().empty()) {
-                        targetAppId = ResolveLuaAppIdByGameName(f->game_name());
-                    }
-                    if (targetAppId == 0) {
-                        auto it = g_FriendAppBySteamId.find(f->friendid());
-                        if (it != g_FriendAppBySteamId.end()) {
-                            targetAppId = it->second;
-                        }
-                    }
-                    if (targetAppId == 0) continue;
+                targetAppId = activeSelfAppId;
+            } else {
+                if (f->has_game_name() && !f->game_name().empty()) {
+                    targetAppId = ResolveLuaAppIdByGameName(f->game_name());
                 }
-
-                g_FriendAppBySteamId[f->friendid()] = targetAppId;
-                g_LastFriendAppId = targetAppId;
-                f->set_game_played_app_id(targetAppId);
-                f->set_gameid(static_cast<uint64>(targetAppId));
-                modified = true;
+                if (targetAppId == 0) {
+                    auto it = g_FriendAppBySteamId.find(f->friendid());
+                    if (it != g_FriendAppBySteamId.end()) {
+                        targetAppId = it->second;
+                    }
+                }
+                if (targetAppId == 0) continue;
             }
+
+            g_FriendAppBySteamId[f->friendid()] = targetAppId;
+            g_LastFriendAppId = targetAppId;
+            f->set_game_played_app_id(targetAppId);
+            f->set_gameid(static_cast<uint64>(targetAppId));
+            modified = true;
         }
 
         if (!modified) return false;
@@ -1511,7 +1516,7 @@ namespace Hooks_NetPacket_OnlineFix {
                 }
             }
         }
-        Hooks_Misc::OnGamesPlayedUpdated(hasOnlineFixApp);
+        Hooks_Misc::OnGamesPlayedUpdated(hasOnlineFixApp || Hooks_NetPacket_RichPresence::g_PlayingAppId != 0);
 
         if (broadcast && !didBroadcastRewrite) {
             AppId_t trackedId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
@@ -2225,6 +2230,9 @@ namespace {
                                   uint32 senderSteamIdField = 0, AppId_t hintAppId = 0)
     {
         AppId_t realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+        if (realAppId == 0 && Hooks_Misc::IsOnlineFixActive()) {
+            realAppId = Hooks_Misc::ResolveAppId();
+        }
         if (realAppId == 0 && hintAppId != 0) {
             realAppId = hintAppId;
         }
@@ -2249,10 +2257,14 @@ namespace {
     bool RewriteFriendMessagesSend(const uint8* pBody, uint32 cbBody,
                                      const uint8* pHdr, uint32 cbHdr)
     {
-        if (Hooks_Misc::IsOnlineFixActive()) return false;
         if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return false;
 
-        AppId_t realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+        const AppId_t fakeAppId = Hooks_Misc::IsOnlineFixActive()
+            ? Hooks_Misc::GetOnlineFixFakeAppId()
+            : kOnlineFixAppId;
+        AppId_t realAppId = Hooks_Misc::IsOnlineFixActive()
+            ? Hooks_Misc::ResolveAppId()
+            : Hooks_NetPacket_RichPresence::g_PlayingAppId;
         CMsgProtoBufHeader hdr;
         const bool hasHdr = pHdr && cbHdr > 0 && hdr.ParseFromArray(pHdr, cbHdr);
         if (realAppId == 0 && hasHdr && hdr.has_routing_appid()) {
@@ -2283,16 +2295,16 @@ namespace {
             g_PendingFriendMsgJobs[hdr.jobid_source()] = jobAppId;
         }
 
-        if (realAppId == 0 || realAppId == kOnlineFixAppId) return false;
+        if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return false;
 
-        RewriteRoutingAppId(pHdr, cbHdr, realAppId, kOnlineFixAppId,
+        RewriteRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
 
         if (pBody && cbBody > 0) {
             std::vector<uint8> rewritten;
             bool changed = false;
             if (RewriteProtoInviteStrings(
-                    pBody, cbBody, std::to_string(realAppId), std::to_string(kOnlineFixAppId),
+                    pBody, cbBody, std::to_string(realAppId), std::to_string(fakeAppId),
                     rewritten, changed) &&
                 changed && rewritten.size() <= kMaxBodySize) {
                 memcpy(g_SendNewBody, rewritten.data(), rewritten.size());
@@ -2307,20 +2319,22 @@ namespace {
                                      const uint8* pHdr, uint32 cbHdr,
                                      AppId_t hintAppId = 0)
     {
-        if (Hooks_Misc::IsOnlineFixActive()) return;
         if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return;
 
+        const AppId_t fakeAppId = Hooks_Misc::IsOnlineFixActive()
+            ? Hooks_Misc::GetOnlineFixFakeAppId()
+            : kOnlineFixAppId;
         const AppId_t realAppId = ResolveRecvLuaAppId(pBody, cbBody, 1, hintAppId);
-        if (realAppId == 0 || realAppId == kOnlineFixAppId) return;
+        if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
 
-        RewriteRoutingAppId(pHdr, cbHdr, kOnlineFixAppId, realAppId,
+        RewriteRoutingAppId(pHdr, cbHdr, fakeAppId, realAppId,
                             g_NewHdr, g_cbNewHdr, g_NeedReplaceHdr);
 
         if (pBody && cbBody > 0) {
             std::vector<uint8> rewritten;
             bool changed = false;
             if (RewriteProtoInviteStrings(
-                    pBody, cbBody, std::to_string(kOnlineFixAppId), std::to_string(realAppId),
+                    pBody, cbBody, std::to_string(fakeAppId), std::to_string(realAppId),
                     rewritten, changed) &&
                 changed) {
                 ApplyRecvBodyRewrite(rewritten);
@@ -2367,7 +2381,7 @@ namespace {
 
     void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
-                                         bool rewriteField1AppId,
+                                         uint32 appIdField,
                                          bool rewriteInviteStrings = false)
     {
         AppId_t realAppId = 0;
@@ -2384,9 +2398,9 @@ namespace {
                     realAppId = TryTrackLuaAppId(hdr.routing_appid());
                 }
             }
-            if (realAppId == 0 && rewriteField1AppId && pBody && cbBody > 0) {
+            if (realAppId == 0 && appIdField != 0 && pBody && cbBody > 0) {
                 uint64 candidate64 = 0;
-                if (Hooks_NetPacket_Cloud::FindVarintField(pBody, cbBody, 1, candidate64)) {
+                if (Hooks_NetPacket_Cloud::FindVarintField(pBody, cbBody, appIdField, candidate64)) {
                     realAppId = TryTrackLuaAppId(static_cast<AppId_t>(candidate64));
                 }
             }
@@ -2396,9 +2410,9 @@ namespace {
         RewriteRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
 
-        if (rewriteField1AppId && pBody && cbBody > 0) {
+        if (appIdField != 0 && pBody && cbBody > 0) {
             std::vector<uint8> rewritten;
-            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, 1, fakeAppId, rewritten, true, realAppId)) {
+            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, appIdField, fakeAppId, rewritten, true, realAppId)) {
                 ApplySendBodyRewrite(rewritten);
             }
         } else if (rewriteInviteStrings && !Hooks_Misc::IsOnlineFixActive() && pBody && cbBody > 0) {
@@ -2415,7 +2429,7 @@ namespace {
 
     void RewriteOnlineFixMmsOrInviteRecv(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
-                                         bool rewriteField1AppId,
+                                         uint32 appIdField,
                                          uint32 senderSteamIdField = 0,
                                          bool rewriteInviteStrings = false)
     {
@@ -2429,9 +2443,9 @@ namespace {
         RewriteRoutingAppId(pHdr, cbHdr, fakeAppId, realAppId,
                             g_NewHdr, g_cbNewHdr, g_NeedReplaceHdr);
 
-        if (rewriteField1AppId && pBody && cbBody > 0) {
+        if (appIdField != 0 && pBody && cbBody > 0) {
             std::vector<uint8> rewritten;
-            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, 1, realAppId, rewritten, true, fakeAppId)) {
+            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, appIdField, realAppId, rewritten, true, fakeAppId)) {
                 ApplyRecvBodyRewrite(rewritten);
             }
         } else if (rewriteInviteStrings && pBody && cbBody > 0) {
@@ -2487,15 +2501,26 @@ namespace {
 
         case k_EMsgClientRichPresenceUpload:           // 7501
             Hooks_NetPacket_RichPresence::TrackRPSend(pBody, cbBody, pHdr, cbHdr);
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 0);
             return;
 
         case k_EMsgClientRichPresenceRequest:          // 7502
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 0);
             return;
 
         case k_EMsgClientInviteToGame:                 // 7005
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false, true);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 0, true);
+            return;
+
+        case k_EMsgClientP2PConnectionInfo:
+        case k_EMsgClientP2PConnectionFailInfo:
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 3);
+            return;
+
+        case k_EMsgClientNetworkingCertRequest:
+        case k_EMsgClientUDSP2PSessionStarted:
+        case k_EMsgClientUDSP2PSessionEnded:
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 2);
             return;
 
         case k_EMsgClientMMSLeaveLobby:                // 6605
@@ -2504,7 +2529,7 @@ namespace {
                 Hooks_NetPacket_RichPresence::g_PlayingAppId != 0) {
                 Hooks_NetPacket_RichPresence::OnLobbyUpdated(Hooks_NetPacket_RichPresence::g_PlayingAppId);
             }
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, true);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 1);
             return;
 
         case k_EMsgClientMMSCreateLobby:               // 6601
@@ -2519,7 +2544,7 @@ namespace {
         case k_EMsgClientMMSSetLobbyLinked:             // 6624
         case k_EMsgClientMMSGetLobbyStatus:            // 6626
         case k_EMsgMMSGetLobbyList:                    // 6628
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, true);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 1);
             return;
 
         case k_EMsgClientGetUserStats:               // 818
@@ -2707,15 +2732,21 @@ namespace {
         case k_EMsgClientMMSInviteToLobby:
         case k_EMsgClientMMSGetLobbyStatusResponse:
         case k_EMsgMMSGetLobbyListResponse:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true);
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, 1);
             return;
 
+        case k_EMsgClientP2PConnectionInfo:
+        case k_EMsgClientP2PConnectionFailInfo:
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, 3, 2);
+            return;
+
+        case k_EMsgClientNetworkingCertRequestResponse:
         case k_EMsgClientRichPresenceInfo:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, false);
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, 0);
             return;
 
         case k_EMsgClientInviteToGame:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, false, 2, true);
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, 0, 2, true);
             return;
 
         case k_EMsgClientPersonaState:                 // 766
