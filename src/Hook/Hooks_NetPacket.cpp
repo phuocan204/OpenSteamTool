@@ -2342,6 +2342,23 @@ namespace {
         }
     }
 
+    bool IsBridgedServiceJob(const char* targetJobName)
+    {
+        if (!targetJobName) return false;
+        static constexpr std::string_view kPrefixes[] = {
+            "SDR.",
+            "SteamNetworking",
+            "Networking",
+            "Lobby",
+            "GameNetworking"
+        };
+        const std::string_view name(targetJobName);
+        for (const auto& prefix : kPrefixes) {
+            if (name.starts_with(prefix)) return true;
+        }
+        return false;
+    }
+
     bool SendServiceJob(const char* targetJobName,
                         const uint8* pBody, uint32 cbBody,
                         const uint8* pHdr, uint32 cbHdr)
@@ -2364,6 +2381,11 @@ namespace {
 
         if (std::strncmp(targetJobName, "FriendMessages", 14) == 0) {
             return RewriteFriendMessagesSend(pBody, cbBody, pHdr, cbHdr);
+        }
+
+        if (IsBridgedServiceJob(targetJobName)) {
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 0);
+            return false;
         }
 
         switch (Fnv1aHash(targetJobName)) {
@@ -2505,6 +2527,7 @@ namespace {
             return;
 
         case k_EMsgClientRichPresenceRequest:          // 7502
+        case k_EMsgClientAuthList:
             RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 0);
             return;
 
@@ -2576,6 +2599,11 @@ namespace {
 
         if (std::strncmp(targetJobName, "FriendMessages", 14) == 0) {
             RewriteFriendMessagesRecv(pBody, cbBody, pHdr, cbHdr, hintAppId);
+            return;
+        }
+
+        if (IsBridgedServiceJob(targetJobName)) {
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, 0);
             return;
         }
 
@@ -2741,6 +2769,7 @@ namespace {
             return;
 
         case k_EMsgClientNetworkingCertRequestResponse:
+        case k_EMsgClientTicketAuthComplete:
         case k_EMsgClientRichPresenceInfo:
             RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, 0);
             return;
