@@ -617,6 +617,9 @@ namespace Hooks_NetPacket_Matchmaking {
             std::ofstream out(txtPath, std::ios::trunc);
             if (out.is_open()) {
                 out << link << "\n";
+                if (appId != kOnlineFixAppId) {
+                    out << std::format("steam://joinlobby/{}/{}/{}\n", kOnlineFixAppId, lobbyId, localId);
+                }
             }
         }
     }
@@ -2254,18 +2257,6 @@ namespace {
         return realAppId;
     }
 
-    bool ShouldBridgeInviteForTarget(const uint8* pBody, uint32 cbBody, uint32 targetSteamIdField)
-    {
-        if (targetSteamIdField == 0 || !pBody || cbBody == 0) return true;
-        uint64 targetSteamId = 0;
-        if (!Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, targetSteamIdField, targetSteamId) ||
-            targetSteamId == 0) {
-            return true;
-        }
-        return Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.find(targetSteamId) !=
-               Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.end();
-    }
-
     bool RewriteFriendMessagesSend(const uint8* pBody, uint32 cbBody,
                                      const uint8* pHdr, uint32 cbHdr)
     {
@@ -2308,7 +2299,6 @@ namespace {
         }
 
         if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return false;
-        if (!ShouldBridgeInviteForTarget(pBody, cbBody, 1)) return false;
 
         RewriteRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
@@ -2375,8 +2365,7 @@ namespace {
     void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
                                          uint32 appIdField,
-                                         bool rewriteInviteStrings = false,
-                                         uint32 targetSteamIdField = 0);
+                                         bool rewriteInviteStrings = false);
 
     bool SendServiceJob(const char* targetJobName,
                         const uint8* pBody, uint32 cbBody,
@@ -2423,10 +2412,8 @@ namespace {
     void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
                                          uint32 appIdField,
-                                         bool rewriteInviteStrings,
-                                         uint32 targetSteamIdField)
+                                         bool rewriteInviteStrings)
     {
-        if (!ShouldBridgeInviteForTarget(pBody, cbBody, targetSteamIdField)) return;
         AppId_t realAppId = 0;
         AppId_t fakeAppId = 0;
         if (Hooks_Misc::IsOnlineFixActive()) {
@@ -2553,19 +2540,22 @@ namespace {
             return;
 
         case k_EMsgClientInviteToGame:                 // 7005
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 0, true, 1);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 0, true);
             return;
 
         case k_EMsgClientMMSInviteToLobby:             // 6621
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 1, false, 3);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 1);
             return;
 
         case k_EMsgClientP2PConnectionInfo:
         case k_EMsgClientP2PConnectionFailInfo:
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 3);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 4);
             return;
 
         case k_EMsgClientNetworkingCertRequest:
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 3);
+            return;
+
         case k_EMsgClientUDSP2PSessionStarted:
         case k_EMsgClientUDSP2PSessionEnded:
             RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 2);
@@ -2789,7 +2779,7 @@ namespace {
 
         case k_EMsgClientP2PConnectionInfo:
         case k_EMsgClientP2PConnectionFailInfo:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, 3, 2);
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, 4, 2);
             return;
 
         case k_EMsgClientNetworkingCertRequestResponse:
