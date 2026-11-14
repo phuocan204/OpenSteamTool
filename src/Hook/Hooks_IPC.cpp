@@ -153,8 +153,7 @@ namespace {
     // 配了 -realappid 时这里只做记录，不改变上报值。
     static void DetectNetworkingSockets(CUtlBuffer* pRead)
     {
-        if (Hooks_Misc::ShouldReportOnlineFixAppId()) return;
-        if (!Hooks_Misc::IsOnlineFixActive() && !LuaConfig::HasDepot(Hooks_Misc::ResolveAppId())) return;
+        if (!Hooks_Misc::IsOnlineFixActive() || Hooks_Misc::ShouldReportOnlineFixAppId()) return;
 
         IPCMessages::IPCRequest request{pRead};
         if (!request.ok() || request.command() != EIPCCommand::InterfaceCall) return;

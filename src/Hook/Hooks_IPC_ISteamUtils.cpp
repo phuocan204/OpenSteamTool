@@ -30,19 +30,15 @@ namespace {
     //  GetAppID reads and updates the response steamclient pre-filled.
     void HandlerPost_IClientUtils_GetAppID(CPipeClient* pipe, CUtlBuffer* pRead, CUtlBuffer* pWrite)
     {
-        GetAppIDResp resp{pWrite};
-        if (!resp.ok()) return;
-
-        if (Hooks_Misc::ShouldReportOnlineFixAppId()) {
-            const AppId_t fakeAppId = Hooks_Misc::GetOnlineFixFakeAppId();
-            if (fakeAppId && resp.returnValue() != fakeAppId) {
-                resp.set_returnValue(fakeAppId);
-            }
-            return;
-        }
+        // P2P 起来之后保持 480：联机会话证书按 480 签发，再改回真实 appid 会对不上。
+        // 本次启动配了 -realappid 时该判断恒为 false，仍然如实回答真实 appid。
+        if (Hooks_Misc::ShouldReportOnlineFixAppId()) return;
 
         AppId_t realAppId = Hooks_Misc::ResolveAppId();
         if (!realAppId) return;
+
+        GetAppIDResp resp{pWrite};
+        if (!resp.ok()) return;
 
         // Read what steamclient just wrote, decide whether to spoof.
         const AppId_t current = resp.returnValue();

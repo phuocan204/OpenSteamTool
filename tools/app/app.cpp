@@ -45,17 +45,6 @@ int main() {
             std::string link = pData->link;
             if (!link.empty()) {
                 std::cout << link << std::endl;
-                constexpr const char kPrefix[] = "steam://joinlobby/";
-                constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
-                if (link.rfind(kPrefix, 0) == 0) {
-                    const size_t slashPos = link.find('/', kPrefixLen);
-                    if (slashPos != std::string::npos) {
-                        const std::string appStr = link.substr(kPrefixLen, slashPos - kPrefixLen);
-                        if (appStr != "480") {
-                            std::cout << kPrefix << "480" << link.substr(slashPos) << std::endl;
-                        }
-                    }
-                }
             }
         }
     }
