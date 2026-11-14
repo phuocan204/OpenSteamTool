@@ -2254,6 +2254,18 @@ namespace {
         return realAppId;
     }
 
+    bool ShouldBridgeInviteForTarget(const uint8* pBody, uint32 cbBody, uint32 targetSteamIdField)
+    {
+        if (targetSteamIdField == 0 || !pBody || cbBody == 0) return true;
+        uint64 targetSteamId = 0;
+        if (!Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, targetSteamIdField, targetSteamId) ||
+            targetSteamId == 0) {
+            return true;
+        }
+        return Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.find(targetSteamId) !=
+               Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.end();
+    }
+
     bool RewriteFriendMessagesSend(const uint8* pBody, uint32 cbBody,
                                      const uint8* pHdr, uint32 cbHdr)
     {
@@ -2296,6 +2308,7 @@ namespace {
         }
 
         if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return false;
+        if (!ShouldBridgeInviteForTarget(pBody, cbBody, 1)) return false;
 
         RewriteRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
@@ -2404,8 +2417,10 @@ namespace {
     void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
                                          uint32 appIdField,
-                                         bool rewriteInviteStrings = false)
+                                         bool rewriteInviteStrings = false,
+                                         uint32 targetSteamIdField = 0)
     {
+        if (!ShouldBridgeInviteForTarget(pBody, cbBody, targetSteamIdField)) return;
         AppId_t realAppId = 0;
         AppId_t fakeAppId = 0;
         if (Hooks_Misc::IsOnlineFixActive()) {
@@ -2532,7 +2547,11 @@ namespace {
             return;
 
         case k_EMsgClientInviteToGame:                 // 7005
-            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 0, true);
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 0, true, 1);
+            return;
+
+        case k_EMsgClientMMSInviteToLobby:             // 6621
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, 1, false, 3);
             return;
 
         case k_EMsgClientP2PConnectionInfo:
@@ -2563,7 +2582,6 @@ namespace {
         case k_EMsgClientMMSSendLobbyChatMsg:          // 6613
         case k_EMsgClientMMSSetLobbyOwner:             // 6615
         case k_EMsgClientMMSSetLobbyGameServer:        // 6617
-        case k_EMsgClientMMSInviteToLobby:             // 6621
         case k_EMsgClientMMSSetLobbyLinked:             // 6624
         case k_EMsgClientMMSGetLobbyStatus:            // 6626
         case k_EMsgMMSGetLobbyList:                    // 6628
