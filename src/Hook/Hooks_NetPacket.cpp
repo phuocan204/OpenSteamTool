@@ -1018,6 +1018,7 @@ namespace Hooks_NetPacket_RichPresence {
     std::unordered_map<AppId_t, std::vector<std::pair<std::string, std::string>>> g_RPKvsByAppId;
     std::unordered_map<uint64, AppId_t> g_FriendAppBySteamId;
     AppId_t g_LastFriendAppId = 0;
+    AppId_t g_LastPlayingAppId = 0;
 
     static AppId_t ResolveLuaAppIdByGameName(const std::string& gameName)
     {
@@ -1265,6 +1266,9 @@ namespace Hooks_NetPacket_RichPresence {
 
         if (g_PlayingAppId == newTracked) return;
         g_PlayingAppId = newTracked;
+        if (newTracked != 0) {
+            g_LastPlayingAppId = newTracked;
+        }
 
         // With display = "none" I skip scheduling broadcast injects here;
         // the running-state tracking above stays intact.
@@ -1936,6 +1940,394 @@ namespace Hooks_NetPacket_LegacyKey {
 // ════════════════════════════════════════════════════════════════
 namespace {
 
+    std::unordered_map<uint64, AppId_t> g_PendingFriendMsgJobs;
+
+    void WriteVarint(std::vector<uint8>& out, uint64 v)
+    {
+        while (v >= 0x80) {
+            out.push_back(static_cast<uint8>((v & 0x7F) | 0x80));
+            v >>= 7;
+        }
+        out.push_back(static_cast<uint8>(v));
+    }
+
+    char ToLowerAscii(char c)
+    {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+    }
+
+    bool IsDigitAscii(char c)
+    {
+        return c >= '0' && c <= '9';
+    }
+
+    bool IsIdentCharAscii(char c)
+    {
+        const char lc = ToLowerAscii(c);
+        return (lc >= 'a' && lc <= 'z') || IsDigitAscii(c) || c == '_';
+    }
+
+    bool StartsWithCaseInsensitive(std::string_view s, size_t pos, const char* prefix, size_t prefixLen)
+    {
+        if (pos + prefixLen > s.size()) return false;
+        for (size_t i = 0; i < prefixLen; ++i) {
+            if (ToLowerAscii(s[pos + i]) != prefix[i]) return false;
+        }
+        return true;
+    }
+
+    bool FindInviteAppIdSpan(std::string_view text, size_t searchFrom, size_t& digitStart, size_t& digitLen)
+    {
+        static constexpr std::string_view kUriPrefixes[] = {
+            "steam://joinlobby/",
+            "steam://rungameid/"
+        };
+        static constexpr std::string_view kKeyPrefixes[] = {
+            "\\\"appid\\\":",
+            "\\\"app_id\\\":",
+            "\"appid\":",
+            "\"app_id\":",
+            "appid=",
+            "app_id=",
+            "appid:",
+            "app_id:"
+        };
+
+        for (size_t i = searchFrom; i < text.size(); ++i) {
+            size_t p = std::string_view::npos;
+            for (const auto& k : kUriPrefixes) {
+                if (StartsWithCaseInsensitive(text, i, k.data(), k.size())) {
+                    p = i + k.size();
+                    break;
+                }
+            }
+            if (p == std::string_view::npos) {
+                for (size_t ki = 0; ki < std::size(kKeyPrefixes); ++ki) {
+                    const auto& k = kKeyPrefixes[ki];
+                    if (ki >= 4 && i > 0 && IsIdentCharAscii(text[i - 1])) continue;
+                    if (StartsWithCaseInsensitive(text, i, k.data(), k.size())) {
+                        p = i + k.size();
+                        while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+                        if (p + 1 < text.size() && text[p] == '\\' && text[p + 1] == '"') {
+                            p += 2;
+                        } else if (p < text.size() && (text[p] == '"' || text[p] == '\'')) {
+                            ++p;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (p == std::string_view::npos) continue;
+
+            size_t q = p;
+            while (q < text.size() && IsDigitAscii(text[q])) ++q;
+            if (q > p) {
+                digitStart = p;
+                digitLen = q - p;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool RewriteInviteAppIdInText(std::string_view text,
+                                  const std::string& fromStr,
+                                  const std::string& toStr,
+                                  std::string& out)
+    {
+        if (fromStr.empty() || toStr.empty() || fromStr == toStr) return false;
+        size_t pos = 0;
+        size_t copied = 0;
+        bool changed = false;
+        size_t dStart = 0;
+        size_t dLen = 0;
+        while (FindInviteAppIdSpan(text, pos, dStart, dLen)) {
+            if (text.substr(dStart, dLen) == fromStr) {
+                if (!changed) {
+                    out.clear();
+                    out.reserve(text.size() + 16);
+                    changed = true;
+                }
+                out.append(text.substr(copied, dStart - copied));
+                out.append(toStr);
+                copied = dStart + dLen;
+            }
+            pos = dStart + dLen;
+        }
+        if (changed) {
+            out.append(text.substr(copied));
+        }
+        return changed;
+    }
+
+    AppId_t TryTrackLuaAppId(AppId_t candidate)
+    {
+        if (candidate != 0 && candidate != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(candidate) && LuaConfig::HasDepot(candidate)) {
+            Hooks_NetPacket_RichPresence::g_PlayingAppId = candidate;
+            Hooks_NetPacket_RichPresence::g_LastPlayingAppId = candidate;
+            return candidate;
+        }
+        return 0;
+    }
+
+    AppId_t ExtractLuaAppIdFromProto(const uint8* d, uint32 size, int depth = 0)
+    {
+        if (!d || size == 0 || depth > 4) return 0;
+        uint32 pos = 0;
+        while (pos < size) {
+            uint64 tag = 0;
+            if (!Hooks_NetPacket_Cloud::ReadVarint(d, size, pos, tag) || tag == 0) return 0;
+            const uint32 wire = static_cast<uint32>(tag & 7u);
+            const uint64 field = tag >> 3;
+            if (field == 0 || field > 10000 || wire == 3 || wire == 4 || wire > 5) return 0;
+            if (wire == 0) {
+                uint64 v = 0;
+                if (!Hooks_NetPacket_Cloud::ReadVarint(d, size, pos, v)) return 0;
+            } else if (wire == 1) {
+                if (pos + 8 > size) return 0;
+                pos += 8;
+            } else if (wire == 5) {
+                if (pos + 4 > size) return 0;
+                pos += 4;
+            } else {
+                uint64 len = 0;
+                if (!Hooks_NetPacket_Cloud::ReadVarint(d, size, pos, len) || len > size - pos) return 0;
+                const uint32 subLen = static_cast<uint32>(len);
+                const uint8* subPtr = d + pos;
+                pos += subLen;
+                if (subLen == 0) continue;
+                AppId_t nested = ExtractLuaAppIdFromProto(subPtr, subLen, depth + 1);
+                if (nested != 0) return nested;
+                std::string_view sv(reinterpret_cast<const char*>(subPtr), subLen);
+                size_t sp = 0;
+                size_t dStart = 0;
+                size_t dLen = 0;
+                while (FindInviteAppIdSpan(sv, sp, dStart, dLen)) {
+                    if (dLen <= 10) {
+                        uint64 val = 0;
+                        for (size_t k = 0; k < dLen; ++k) {
+                            val = val * 10 + static_cast<uint64>(sv[dStart + k] - '0');
+                        }
+                        if (val <= UINT32_MAX) {
+                            AppId_t tracked = TryTrackLuaAppId(static_cast<AppId_t>(val));
+                            if (tracked != 0) return tracked;
+                        }
+                    }
+                    sp = dStart + dLen;
+                }
+            }
+        }
+        return 0;
+    }
+
+    bool RewriteProtoInviteStrings(const uint8* d, uint32 size,
+                                   const std::string& fromStr,
+                                   const std::string& toStr,
+                                   std::vector<uint8>& out,
+                                   bool& changed,
+                                   int depth = 0)
+    {
+        changed = false;
+        if (!d || size == 0 || depth > 5) return false;
+        out.clear();
+        out.reserve(size + 32);
+        uint32 pos = 0;
+        while (pos < size) {
+            const uint32 fieldStart = pos;
+            uint64 tag = 0;
+            if (!Hooks_NetPacket_Cloud::ReadVarint(d, size, pos, tag) || tag == 0) return false;
+            const uint32 wire = static_cast<uint32>(tag & 7u);
+            const uint64 field = tag >> 3;
+            if (field == 0 || field > 10000 || wire == 3 || wire == 4 || wire > 5) return false;
+            if (wire == 0) {
+                uint64 v = 0;
+                if (!Hooks_NetPacket_Cloud::ReadVarint(d, size, pos, v)) return false;
+                out.insert(out.end(), d + fieldStart, d + pos);
+            } else if (wire == 1) {
+                if (pos + 8 > size) return false;
+                pos += 8;
+                out.insert(out.end(), d + fieldStart, d + pos);
+            } else if (wire == 5) {
+                if (pos + 4 > size) return false;
+                pos += 4;
+                out.insert(out.end(), d + fieldStart, d + pos);
+            } else {
+                const uint32 hdrEnd = pos;
+                uint64 len = 0;
+                if (!Hooks_NetPacket_Cloud::ReadVarint(d, size, pos, len) || len > size - pos) return false;
+                const uint32 subLen = static_cast<uint32>(len);
+                const uint8* subPtr = d + pos;
+                pos += subLen;
+
+                std::vector<uint8> subOut;
+                bool subChanged = false;
+                if (subLen > 0 &&
+                    RewriteProtoInviteStrings(subPtr, subLen, fromStr, toStr, subOut, subChanged, depth + 1) &&
+                    subChanged) {
+                    out.insert(out.end(), d + fieldStart, d + hdrEnd);
+                    WriteVarint(out, subOut.size());
+                    out.insert(out.end(), subOut.begin(), subOut.end());
+                    changed = true;
+                } else {
+                    std::string replacedStr;
+                    if (subLen > 0 &&
+                        RewriteInviteAppIdInText(
+                            std::string_view(reinterpret_cast<const char*>(subPtr), subLen),
+                            fromStr, toStr, replacedStr)) {
+                        out.insert(out.end(), d + fieldStart, d + hdrEnd);
+                        WriteVarint(out, replacedStr.size());
+                        out.insert(out.end(), replacedStr.begin(), replacedStr.end());
+                        changed = true;
+                    } else {
+                        out.insert(out.end(), d + fieldStart, d + pos);
+                    }
+                }
+            }
+        }
+        return pos == size;
+    }
+
+    void RewriteRoutingAppId(const uint8* pHdr, uint32 cbHdr,
+                             AppId_t fromAppId, AppId_t toAppId,
+                             uint8* dstHdr, uint32& cbDstHdr, bool& needReplace)
+    {
+        if (!pHdr || cbHdr == 0 || fromAppId == 0 || toAppId == 0 || fromAppId == toAppId) return;
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr)) return;
+        if (!hdr.has_routing_appid() || hdr.routing_appid() != fromAppId) return;
+        hdr.set_routing_appid(toAppId);
+        const uint32 newHdrSize = static_cast<uint32>(hdr.ByteSizeLong());
+        if (newHdrSize <= kMaxHdrSize && hdr.SerializeToArray(dstHdr, kMaxHdrSize)) {
+            cbDstHdr = newHdrSize;
+            needReplace = true;
+        }
+    }
+
+    void ApplySendBodyRewrite(const std::vector<uint8>& rewritten)
+    {
+        if (rewritten.size() <= kMaxBodySize) {
+            memcpy(g_SendNewBody, rewritten.data(), rewritten.size());
+            g_cbSendNewBody = static_cast<uint32>(rewritten.size());
+            g_NeedReplaceSend = true;
+        }
+    }
+
+    void ApplyRecvBodyRewrite(const std::vector<uint8>& rewritten)
+    {
+        if (rewritten.size() <= kMaxBodySize) {
+            memcpy(g_NewBody, rewritten.data(), rewritten.size());
+            g_cbNewBody = static_cast<uint32>(rewritten.size());
+            g_NeedReplaceBody = true;
+        }
+    }
+
+    AppId_t ResolveRecvLuaAppId(const uint8* pBody, uint32 cbBody,
+                                  uint32 senderSteamIdField = 0, AppId_t hintAppId = 0)
+    {
+        AppId_t realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+        if (realAppId == 0 && hintAppId != 0) {
+            realAppId = hintAppId;
+        }
+        if (realAppId == 0 && senderSteamIdField != 0 && pBody && cbBody > 0) {
+            uint64 senderSteamId = 0;
+            if (Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, senderSteamIdField, senderSteamId)) {
+                auto it = Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.find(senderSteamId);
+                if (it != Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.end()) {
+                    realAppId = it->second;
+                }
+            }
+        }
+        if (realAppId == 0) {
+            realAppId = Hooks_NetPacket_RichPresence::g_LastFriendAppId;
+        }
+        if (realAppId == 0) {
+            realAppId = Hooks_NetPacket_RichPresence::g_LastPlayingAppId;
+        }
+        return realAppId;
+    }
+
+    bool RewriteFriendMessagesSend(const uint8* pBody, uint32 cbBody,
+                                     const uint8* pHdr, uint32 cbHdr)
+    {
+        if (Hooks_Misc::IsOnlineFixActive()) return false;
+        if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return false;
+
+        AppId_t realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+        CMsgProtoBufHeader hdr;
+        const bool hasHdr = pHdr && cbHdr > 0 && hdr.ParseFromArray(pHdr, cbHdr);
+        if (realAppId == 0 && hasHdr && hdr.has_routing_appid()) {
+            realAppId = TryTrackLuaAppId(hdr.routing_appid());
+        }
+        if (realAppId == 0 && pBody && cbBody > 0) {
+            realAppId = ExtractLuaAppIdFromProto(pBody, cbBody);
+        }
+        if (realAppId == 0) {
+            realAppId = Hooks_NetPacket_RichPresence::g_LastPlayingAppId;
+        }
+
+        if (hasHdr && hdr.has_jobid_source() && hdr.jobid_source() != 0) {
+            AppId_t jobAppId = realAppId;
+            if (jobAppId == 0 && pBody && cbBody > 0) {
+                uint64 peerId = 0;
+                if (Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, 2, peerId) ||
+                    Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, 1, peerId)) {
+                    auto it = Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.find(peerId);
+                    if (it != Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.end()) {
+                        jobAppId = it->second;
+                    }
+                }
+            }
+            if (g_PendingFriendMsgJobs.size() >= 256) {
+                g_PendingFriendMsgJobs.clear();
+            }
+            g_PendingFriendMsgJobs[hdr.jobid_source()] = jobAppId;
+        }
+
+        if (realAppId == 0 || realAppId == kOnlineFixAppId) return false;
+
+        RewriteRoutingAppId(pHdr, cbHdr, realAppId, kOnlineFixAppId,
+                            g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
+
+        if (pBody && cbBody > 0) {
+            std::vector<uint8> rewritten;
+            bool changed = false;
+            if (RewriteProtoInviteStrings(
+                    pBody, cbBody, std::to_string(realAppId), std::to_string(kOnlineFixAppId),
+                    rewritten, changed) &&
+                changed && rewritten.size() <= kMaxBodySize) {
+                memcpy(g_SendNewBody, rewritten.data(), rewritten.size());
+                g_cbSendNewBody = static_cast<uint32>(rewritten.size());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void RewriteFriendMessagesRecv(const uint8* pBody, uint32 cbBody,
+                                     const uint8* pHdr, uint32 cbHdr,
+                                     AppId_t hintAppId = 0)
+    {
+        if (Hooks_Misc::IsOnlineFixActive()) return;
+        if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return;
+
+        const AppId_t realAppId = ResolveRecvLuaAppId(pBody, cbBody, 1, hintAppId);
+        if (realAppId == 0 || realAppId == kOnlineFixAppId) return;
+
+        RewriteRoutingAppId(pHdr, cbHdr, kOnlineFixAppId, realAppId,
+                            g_NewHdr, g_cbNewHdr, g_NeedReplaceHdr);
+
+        if (pBody && cbBody > 0) {
+            std::vector<uint8> rewritten;
+            bool changed = false;
+            if (RewriteProtoInviteStrings(
+                    pBody, cbBody, std::to_string(kOnlineFixAppId), std::to_string(realAppId),
+                    rewritten, changed) &&
+                changed) {
+                ApplyRecvBodyRewrite(rewritten);
+            }
+        }
+    }
+
     bool SendServiceJob(const char* targetJobName,
                         const uint8* pBody, uint32 cbBody,
                         const uint8* pHdr, uint32 cbHdr)
@@ -1956,6 +2348,10 @@ namespace {
             return false;   // never body-replace a cloud frame
         }
 
+        if (std::strncmp(targetJobName, "FriendMessages", 14) == 0) {
+            return RewriteFriendMessagesSend(pBody, cbBody, pHdr, cbHdr);
+        }
+
         switch (Fnv1aHash(targetJobName)) {
 
         case HASH_JOB_GetUserStats:
@@ -1969,32 +2365,10 @@ namespace {
         return false;
     }
 
-    void RewriteSendRoutingAppId(const uint8* pHdr, uint32 cbHdr, AppId_t realAppId, AppId_t fakeAppId)
-    {
-        if (!pHdr || cbHdr == 0 || realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
-        CMsgProtoBufHeader hdr;
-        if (!hdr.ParseFromArray(pHdr, cbHdr)) return;
-        if (!hdr.has_routing_appid() || hdr.routing_appid() != realAppId) return;
-        hdr.set_routing_appid(fakeAppId);
-        const uint32 newHdrSize = static_cast<uint32>(hdr.ByteSizeLong());
-        if (newHdrSize <= kMaxHdrSize && hdr.SerializeToArray(g_SendNewHdr, kMaxHdrSize)) {
-            g_cbSendNewHdr = newHdrSize;
-            g_NeedReplaceSendHdr = true;
-        }
-    }
-
-    static AppId_t TryTrackLuaAppId(AppId_t candidate)
-    {
-        if (candidate != 0 && candidate != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(candidate) && LuaConfig::HasDepot(candidate)) {
-            Hooks_NetPacket_RichPresence::g_PlayingAppId = candidate;
-            return candidate;
-        }
-        return 0;
-    }
-
     void RewriteOnlineFixMmsOrInviteSend(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
-                                         bool rewriteField1AppId)
+                                         bool rewriteField1AppId,
+                                         bool rewriteInviteStrings = false)
     {
         AppId_t realAppId = 0;
         AppId_t fakeAppId = 0;
@@ -2019,15 +2393,22 @@ namespace {
         }
         if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
 
-        RewriteSendRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId);
+        RewriteRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId,
+                            g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
 
         if (rewriteField1AppId && pBody && cbBody > 0) {
             std::vector<uint8> rewritten;
-            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, 1, fakeAppId, rewritten, true, realAppId) &&
-                rewritten.size() <= kMaxBodySize) {
-                memcpy(g_SendNewBody, rewritten.data(), rewritten.size());
-                g_cbSendNewBody = static_cast<uint32>(rewritten.size());
-                g_NeedReplaceSend = true;
+            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, 1, fakeAppId, rewritten, true, realAppId)) {
+                ApplySendBodyRewrite(rewritten);
+            }
+        } else if (rewriteInviteStrings && !Hooks_Misc::IsOnlineFixActive() && pBody && cbBody > 0) {
+            std::vector<uint8> rewritten;
+            bool changed = false;
+            if (RewriteProtoInviteStrings(
+                    pBody, cbBody, std::to_string(realAppId), std::to_string(fakeAppId),
+                    rewritten, changed) &&
+                changed) {
+                ApplySendBodyRewrite(rewritten);
             }
         }
     }
@@ -2035,46 +2416,32 @@ namespace {
     void RewriteOnlineFixMmsOrInviteRecv(const uint8* pBody, uint32 cbBody,
                                          const uint8* pHdr, uint32 cbHdr,
                                          bool rewriteField1AppId,
-                                         uint32 senderSteamIdField = 0)
+                                         uint32 senderSteamIdField = 0,
+                                         bool rewriteInviteStrings = false)
     {
         if (Hooks_Misc::IsOnlineFixActive()) return;
         if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return;
 
-        AppId_t realAppId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
-        if (realAppId == 0 && senderSteamIdField != 0 && pBody && cbBody > 0) {
-            uint64 senderSteamId = 0;
-            if (Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, senderSteamIdField, senderSteamId)) {
-                auto it = Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.find(senderSteamId);
-                if (it != Hooks_NetPacket_RichPresence::g_FriendAppBySteamId.end()) {
-                    realAppId = it->second;
-                }
-            }
-        }
-        if (realAppId == 0) {
-            realAppId = Hooks_NetPacket_RichPresence::g_LastFriendAppId;
-        }
+        const AppId_t realAppId = ResolveRecvLuaAppId(pBody, cbBody, senderSteamIdField);
         const AppId_t fakeAppId = kOnlineFixAppId;
         if (realAppId == 0 || fakeAppId == 0 || realAppId == fakeAppId) return;
 
-        if (pHdr && cbHdr > 0) {
-            CMsgProtoBufHeader hdr;
-            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_routing_appid() && hdr.routing_appid() == fakeAppId) {
-                hdr.set_routing_appid(realAppId);
-                const uint32 newHdrSize = static_cast<uint32>(hdr.ByteSizeLong());
-                if (newHdrSize <= kMaxHdrSize && hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)) {
-                    g_cbNewHdr = newHdrSize;
-                    g_NeedReplaceHdr = true;
-                }
-            }
-        }
+        RewriteRoutingAppId(pHdr, cbHdr, fakeAppId, realAppId,
+                            g_NewHdr, g_cbNewHdr, g_NeedReplaceHdr);
 
         if (rewriteField1AppId && pBody && cbBody > 0) {
             std::vector<uint8> rewritten;
-            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, 1, realAppId, rewritten, true, fakeAppId) &&
-                rewritten.size() <= kMaxBodySize) {
-                memcpy(g_NewBody, rewritten.data(), rewritten.size());
-                g_cbNewBody = static_cast<uint32>(rewritten.size());
-                g_NeedReplaceBody = true;
+            if (Hooks_NetPacket_Cloud::RewriteVarintField(pBody, cbBody, 1, realAppId, rewritten, true, fakeAppId)) {
+                ApplyRecvBodyRewrite(rewritten);
+            }
+        } else if (rewriteInviteStrings && pBody && cbBody > 0) {
+            std::vector<uint8> rewritten;
+            bool changed = false;
+            if (RewriteProtoInviteStrings(
+                    pBody, cbBody, std::to_string(fakeAppId), std::to_string(realAppId),
+                    rewritten, changed) &&
+                changed) {
+                ApplyRecvBodyRewrite(rewritten);
             }
         }
     }
@@ -2124,8 +2491,11 @@ namespace {
             return;
 
         case k_EMsgClientRichPresenceRequest:          // 7502
-        case k_EMsgClientInviteToGame:                 // 7005
             RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false);
+            return;
+
+        case k_EMsgClientInviteToGame:                 // 7005
+            RewriteOnlineFixMmsOrInviteSend(pBody, cbBody, pHdr, cbHdr, false, true);
             return;
 
         case k_EMsgClientMMSLeaveLobby:                // 6605
@@ -2172,11 +2542,17 @@ namespace {
 
     void RecvServiceJob(const char* targetJobName,
                         const uint8* pBody, uint32 cbBody,
-                        const uint8* pHdr, uint32 cbHdr)
+                        const uint8* pHdr, uint32 cbHdr,
+                        AppId_t hintAppId = 0)
     {
         LOG_NETPACKET_DEBUG("Recv target_job_name: {}", targetJobName);
         g_NeedReplaceBody = false;
         g_NeedReplaceHdr  = false;
+
+        if (std::strncmp(targetJobName, "FriendMessages", 14) == 0) {
+            RewriteFriendMessagesRecv(pBody, cbBody, pHdr, cbHdr, hintAppId);
+            return;
+        }
 
         switch (Fnv1aHash(targetJobName)) {
 
@@ -2261,8 +2637,23 @@ namespace {
         case k_EMsgServiceMethodResponse:              // 147
         case k_EMsgServiceMethodSendToClient: {        // 152
             CMsgProtoBufHeader hdr;
-            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name())
-                RecvServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
+            if (hdr.ParseFromArray(pHdr, cbHdr)) {
+                AppId_t hintAppId = 0;
+                bool matchedPendingFriendMsg = false;
+                if (eMsg == k_EMsgServiceMethodResponse && hdr.has_jobid_target()) {
+                    auto it = g_PendingFriendMsgJobs.find(hdr.jobid_target());
+                    if (it != g_PendingFriendMsgJobs.end()) {
+                        hintAppId = it->second;
+                        matchedPendingFriendMsg = true;
+                        g_PendingFriendMsgJobs.erase(it);
+                    }
+                }
+                if (hdr.has_target_job_name()) {
+                    RecvServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr, hintAppId);
+                } else if (matchedPendingFriendMsg) {
+                    RewriteFriendMessagesRecv(pBody, cbBody, pHdr, cbHdr, hintAppId);
+                }
+            }
             return;
         }
 
@@ -2324,7 +2715,7 @@ namespace {
             return;
 
         case k_EMsgClientInviteToGame:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, false, 2);
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, false, 2, true);
             return;
 
         case k_EMsgClientPersonaState:                 // 766
