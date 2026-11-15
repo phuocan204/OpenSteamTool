@@ -1006,29 +1006,27 @@ namespace Hooks_NetPacket_Manifest {
 namespace Hooks_NetPacket_RichPresence {
 
     AppId_t g_PlayingAppId = 0;
+    AppId_t g_CurrentTopmostAppId = 0;
     AppId_t g_CloudRunningAppId = 0;
     uint64  g_LocalSteamId = 0;
 
-    // Most recent self-PersonaState bytes captured from a real server push.
-    // Reused as the template every game launch.
     uint8   g_SelfHdr [kMaxHdrSize];
     uint32  g_cbSelfHdr      = 0;
     uint8   g_SelfBody[kMaxBodySize];
     uint32  g_cbSelfBody     = 0;
     bool    g_HaveSelfCached = false;
 
-    // Manufactured PersonaState packet (eMsg 766) ready to inject.
     uint8   g_InjectPkt[kMaxPacketSize];
     uint32  g_cbInjectPkt   = 0;
     bool    g_InjectPending = false;
 
-    // Rich presence KVs per AppId, captured from outbound
-    // CMsgClientRichPresenceUpload.  Per-AppId so a multi-game stack
-    // does not conflate KV state.
     std::unordered_map<AppId_t, std::vector<std::pair<std::string, std::string>>> g_RPKvsByAppId;
     std::unordered_map<uint64, AppId_t> g_FriendAppBySteamId;
     std::unordered_set<uint64> g_FriendOstActiveBySteamId;
     std::unordered_map<uint64, std::string> g_FriendGameNameBySteamId;
+    std::unordered_map<uint64, CMsgClientPersonaState::Friend> g_FriendPersonaBySteamId;
+    std::deque<std::vector<uint8>> g_FriendInjectQueue;
+    std::mutex g_FriendInjectMutex;
     std::unordered_map<uint64, AppId_t> g_LobbyAppIdByLobbyId;
     std::mutex g_LobbyMapMutex;
     AppId_t g_LastFriendAppId = 0;
@@ -1066,18 +1064,32 @@ namespace Hooks_NetPacket_RichPresence {
                 return id;
             }
         }
+        if (g_CurrentTopmostAppId != 0 &&
+            g_CurrentTopmostAppId != kOnlineFixAppId &&
+            !Hooks_Misc::IsOnlineFixFakeAppId(g_CurrentTopmostAppId) &&
+            Hooks_Misc::GetGameNameByAppID(g_CurrentTopmostAppId) == gameName) {
+            s_cache[gameName] = g_CurrentTopmostAppId;
+            return g_CurrentTopmostAppId;
+        }
+        for (AppId_t id : Hooks_Package::GetKnownAppIds()) {
+            if (id == 0 || id == kOnlineFixAppId || Hooks_Misc::IsOnlineFixFakeAppId(id)) continue;
+            if (Hooks_Misc::GetGameNameByAppID(id) == gameName) {
+                s_cache[gameName] = id;
+                return id;
+            }
+        }
         return 0;
     }
 
     bool IsRecipientUsingOstLuaForApp(uint64 friendSteamId, AppId_t appId)
     {
         if (friendSteamId == 0 || appId == 0 || !LuaConfig::HasDepot(appId)) return false;
+        if (g_FriendOstActiveBySteamId.find(friendSteamId) == g_FriendOstActiveBySteamId.end()) {
+            return false;
+        }
         auto appIt = g_FriendAppBySteamId.find(friendSteamId);
         if (appIt != g_FriendAppBySteamId.end() && appIt->second != 0) {
             return appIt->second == appId;
-        }
-        if (g_FriendOstActiveBySteamId.find(friendSteamId) == g_FriendOstActiveBySteamId.end()) {
-            return false;
         }
         auto nameIt = g_FriendGameNameBySteamId.find(friendSteamId);
         if (nameIt != g_FriendGameNameBySteamId.end() && !nameIt->second.empty()) {
@@ -1287,13 +1299,12 @@ namespace Hooks_NetPacket_RichPresence {
         }
 
         // Steam stacks running games in games_played; the banner follows
-        // the tail (most recently launched).  Mirror that — only the
-        // tail's appid drives our inject.
         AppId_t topmost = 0;
         if (msg.games_played_size() > 0) {
             topmost = static_cast<AppId_t>(
                 msg.games_played(msg.games_played_size() - 1).game_id() & UINT32_MAX);
         }
+        g_CurrentTopmostAppId = topmost;
 
         AppId_t newCloudTracked = 0;
         if (topmost != 0) {
@@ -1391,13 +1402,14 @@ namespace Hooks_NetPacket_RichPresence {
 
         const AppId_t currentLocalAppId = Hooks_Misc::IsOnlineFixActive()
             ? Hooks_Misc::ResolveAppId()
-            : g_PlayingAppId;
+            : (g_PlayingAppId != 0 ? g_PlayingAppId : g_CurrentTopmostAppId);
         const std::string myGameName = currentLocalAppId != 0
             ? Hooks_Misc::GetGameNameByAppID(currentLocalAppId)
             : std::string();
         for (int i = 0; i < msg.friends_size(); ++i) {
             auto* f = msg.mutable_friends(i);
             if (!f->has_friendid() || f->friendid() == g_LocalSteamId) continue;
+            g_FriendPersonaBySteamId[f->friendid()] = *f;
             const bool hasGameIdField = f->has_game_played_app_id() || f->has_gameid();
             const AppId_t fAppId = f->has_game_played_app_id()
                 ? f->game_played_app_id()
@@ -1446,6 +1458,7 @@ namespace Hooks_NetPacket_RichPresence {
             if (!Hooks_Misc::IsOnlineFixActive()) {
                 f->set_game_played_app_id(targetAppId);
                 f->set_gameid(static_cast<uint64>(targetAppId));
+                g_FriendPersonaBySteamId[f->friendid()] = *f;
                 modified = true;
             }
         }
@@ -1465,22 +1478,90 @@ namespace Hooks_NetPacket_RichPresence {
         return true;
     }
 
-    // Deliver the pending manufactured PersonaState by borrowing the
-    // carrier's data pointer for one oRecvPkt call, then restore.
+    void InjectFriendPersonaAppId(uint64 friendSteamId, AppId_t appId, uint64 lobbyId = 0)
+    {
+        if (friendSteamId == 0 || appId == 0 || appId == kOnlineFixAppId || Hooks_Misc::IsOnlineFixActive()) return;
+        if (!BroadcastEnabled() || !g_HaveSelfCached) return;
+
+        g_FriendAppBySteamId[friendSteamId] = appId;
+        g_LastFriendAppId = appId;
+
+        CMsgClientPersonaState msg;
+        constexpr uint32 kStatusFlagStatus = 0x0001;
+        constexpr uint32 kStatusFlagGameExtraInfo = 0x0100;
+        msg.set_status_flags(kStatusFlagStatus | kStatusFlagGameExtraInfo);
+
+        auto* entry = msg.add_friends();
+        auto cachedIt = g_FriendPersonaBySteamId.find(friendSteamId);
+        if (cachedIt != g_FriendPersonaBySteamId.end()) {
+            *entry = cachedIt->second;
+        } else {
+            entry->set_friendid(friendSteamId);
+            entry->set_persona_state(1);
+        }
+        entry->set_game_played_app_id(appId);
+        entry->set_gameid(static_cast<uint64>(appId));
+        std::string name = Hooks_Misc::GetGameNameByAppID(appId);
+        if (!name.empty()) {
+            entry->set_game_name(name);
+        }
+        if (lobbyId != 0) {
+            entry->set_game_lobby_id(lobbyId);
+        }
+        g_FriendPersonaBySteamId[friendSteamId] = *entry;
+
+        const uint32 hdrSize = g_cbSelfHdr;
+        const uint32 bodySize = static_cast<uint32>(msg.ByteSizeLong());
+        const uint32 total = sizeof(MsgHdr) + hdrSize + bodySize;
+        if (total > kMaxPacketSize || bodySize > kMaxBodySize) return;
+
+        std::vector<uint8> pkt(total);
+        auto* mhdr = reinterpret_cast<MsgHdr*>(pkt.data());
+        mhdr->eMsg = static_cast<EMsg>(
+            static_cast<uint32>(k_EMsgClientPersonaState) | kMsgHdrProtoFlag);
+        mhdr->headerLength = hdrSize;
+        memcpy(pkt.data() + sizeof(MsgHdr), g_SelfHdr, hdrSize);
+        if (!msg.SerializeToArray(pkt.data() + sizeof(MsgHdr) + hdrSize, bodySize)) return;
+
+        std::lock_guard<std::mutex> lock(g_FriendInjectMutex);
+        if (g_FriendInjectQueue.size() < 32) {
+            g_FriendInjectQueue.push_back(std::move(pkt));
+        }
+    }
+
     void TryInject(void* pThis, CNetPacket* pCarrier,
                    bool (*invokeOriginal)(void*, CNetPacket*))
     {
-        if (!g_InjectPending || g_cbInjectPkt == 0) return;
-        g_InjectPending = false;
+        if (g_InjectPending && g_cbInjectPkt != 0) {
+            g_InjectPending = false;
 
-        uint8* origData = PktData(pCarrier);
-        uint32 origSize = PktSize(pCarrier);
-        SetPktData(pCarrier, g_InjectPkt);
-        SetPktSize(pCarrier, g_cbInjectPkt);
-        invokeOriginal(pThis, pCarrier);
-        SetPktData(pCarrier, origData);
-        SetPktSize(pCarrier, origSize);
-        LOG_RICHPRESENCE_INFO("Delivered manufactured self-PersonaState ({} bytes)", g_cbInjectPkt);
+            uint8* origData = PktData(pCarrier);
+            uint32 origSize = PktSize(pCarrier);
+            SetPktData(pCarrier, g_InjectPkt);
+            SetPktSize(pCarrier, g_cbInjectPkt);
+            invokeOriginal(pThis, pCarrier);
+            SetPktData(pCarrier, origData);
+            SetPktSize(pCarrier, origSize);
+            LOG_RICHPRESENCE_INFO("Delivered manufactured self-PersonaState ({} bytes)", g_cbInjectPkt);
+        }
+
+        for (;;) {
+            std::vector<uint8> pkt;
+            {
+                std::lock_guard<std::mutex> lock(g_FriendInjectMutex);
+                if (g_FriendInjectQueue.empty()) break;
+                pkt = std::move(g_FriendInjectQueue.front());
+                g_FriendInjectQueue.pop_front();
+            }
+            if (pkt.empty()) continue;
+            uint8* origData = PktData(pCarrier);
+            uint32 origSize = PktSize(pCarrier);
+            SetPktData(pCarrier, pkt.data());
+            SetPktSize(pCarrier, static_cast<uint32>(pkt.size()));
+            invokeOriginal(pThis, pCarrier);
+            SetPktData(pCarrier, origData);
+            SetPktSize(pCarrier, origSize);
+        }
     }
 
 } // namespace Hooks_NetPacket_RichPresence
@@ -2351,14 +2432,49 @@ namespace {
         return targetId;
     }
 
-    void TrackJoinLobbyLinksInText(std::string_view text, AppId_t defaultAppId)
+    void TrackJoinLobbyLinksInText(std::string_view text, AppId_t defaultAppId,
+                                   AppId_t* outInviteAppId = nullptr,
+                                   uint64* outInviteLobbyId = nullptr,
+                                   bool* outHasInviteTag = nullptr)
     {
         static constexpr std::string_view kJoinPrefix = "steam://joinlobby/";
         static constexpr std::string_view kConnectPrefix = "+connect_lobby";
         static constexpr std::string_view kLobbyIdAttr = "lobbyid=";
         static constexpr std::string_view kLobbyAttr = "lobby=";
+        static constexpr std::string_view kLobbyInviteTag = "lobbyinvite";
+        static constexpr std::string_view kGameInviteTag = "gameinvite";
+
+        size_t spanPos = 0;
+        size_t dStart = 0;
+        size_t dLen = 0;
+        while (FindInviteAppIdSpan(text, spanPos, dStart, dLen)) {
+            if (dLen <= 10) {
+                uint64 val = 0;
+                for (size_t k = 0; k < dLen; ++k) {
+                    val = val * 10 + static_cast<uint64>(text[dStart + k] - '0');
+                }
+                if (val > 0 && val <= UINT32_MAX) {
+                    if (outInviteAppId && *outInviteAppId == 0) {
+                        *outInviteAppId = static_cast<AppId_t>(val);
+                    }
+                    if (outHasInviteTag) {
+                        *outHasInviteTag = true;
+                    }
+                }
+            }
+            spanPos = dStart + dLen;
+        }
+
+        const AppId_t effectiveDefaultAppId = (defaultAppId != 0)
+            ? defaultAppId
+            : (outInviteAppId ? *outInviteAppId : 0);
 
         for (size_t i = 0; i < text.size(); ++i) {
+            if (outHasInviteTag && !*outHasInviteTag &&
+                (StartsWithCaseInsensitive(text, i, kLobbyInviteTag.data(), kLobbyInviteTag.size()) ||
+                 StartsWithCaseInsensitive(text, i, kGameInviteTag.data(), kGameInviteTag.size()))) {
+                *outHasInviteTag = true;
+            }
             if (StartsWithCaseInsensitive(text, i, kJoinPrefix.data(), kJoinPrefix.size())) {
                 size_t p = i + kJoinPrefix.size();
                 uint64 parsedAppId = 0;
@@ -2377,9 +2493,11 @@ namespace {
                     }
                     if (p > lStart && parsedLobbyId != 0) {
                         Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedLobbyId, static_cast<AppId_t>(parsedAppId));
+                        if (outInviteAppId && *outInviteAppId == 0) *outInviteAppId = static_cast<AppId_t>(parsedAppId);
+                        if (outInviteLobbyId && *outInviteLobbyId == 0) *outInviteLobbyId = parsedLobbyId;
                     }
                 }
-            } else if (defaultAppId != 0 && StartsWithCaseInsensitive(text, i, kConnectPrefix.data(), kConnectPrefix.size())) {
+            } else if (StartsWithCaseInsensitive(text, i, kConnectPrefix.data(), kConnectPrefix.size())) {
                 size_t p = i + kConnectPrefix.size();
                 while (p < text.size() && (text[p] == ' ' || text[p] == '\t' || text[p] == '"' || text[p] == '\'')) ++p;
                 uint64 parsedLobbyId = 0;
@@ -2389,11 +2507,13 @@ namespace {
                     ++p;
                 }
                 if (p > lStart && parsedLobbyId != 0) {
-                    Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedLobbyId, defaultAppId);
+                    if (effectiveDefaultAppId != 0) {
+                        Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedLobbyId, effectiveDefaultAppId);
+                    }
+                    if (outInviteLobbyId && *outInviteLobbyId == 0) *outInviteLobbyId = parsedLobbyId;
                 }
-            } else if (defaultAppId != 0 &&
-                       (StartsWithCaseInsensitive(text, i, kLobbyIdAttr.data(), kLobbyIdAttr.size()) ||
-                        StartsWithCaseInsensitive(text, i, kLobbyAttr.data(), kLobbyAttr.size()))) {
+            } else if (StartsWithCaseInsensitive(text, i, kLobbyIdAttr.data(), kLobbyIdAttr.size()) ||
+                       StartsWithCaseInsensitive(text, i, kLobbyAttr.data(), kLobbyAttr.size())) {
                 const size_t keyLen = StartsWithCaseInsensitive(text, i, kLobbyIdAttr.data(), kLobbyIdAttr.size())
                     ? kLobbyIdAttr.size()
                     : kLobbyAttr.size();
@@ -2406,13 +2526,19 @@ namespace {
                     ++p;
                 }
                 if (p > lStart && parsedLobbyId != 0) {
-                    Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedLobbyId, defaultAppId);
+                    if (effectiveDefaultAppId != 0) {
+                        Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedLobbyId, effectiveDefaultAppId);
+                    }
+                    if (outInviteLobbyId && *outInviteLobbyId == 0) *outInviteLobbyId = parsedLobbyId;
                 }
             }
         }
     }
 
-    void TrackJoinLobbyLinksInProto(const uint8* d, uint32 size, AppId_t defaultAppId, int depth = 0)
+    void TrackJoinLobbyLinksInProto(const uint8* d, uint32 size, AppId_t defaultAppId, int depth = 0,
+                                    AppId_t* outInviteAppId = nullptr,
+                                    uint64* outInviteLobbyId = nullptr,
+                                    bool* outHasInviteTag = nullptr)
     {
         if (!d || size == 0 || depth > 5) return;
         uint32 pos = 0;
@@ -2438,10 +2564,89 @@ namespace {
                 const uint8* subPtr = d + pos;
                 pos += subLen;
                 if (subLen == 0) continue;
-                TrackJoinLobbyLinksInProto(subPtr, subLen, defaultAppId, depth + 1);
-                TrackJoinLobbyLinksInText(std::string_view(reinterpret_cast<const char*>(subPtr), subLen), defaultAppId);
+                TrackJoinLobbyLinksInProto(subPtr, subLen, defaultAppId, depth + 1, outInviteAppId, outInviteLobbyId, outHasInviteTag);
+                TrackJoinLobbyLinksInText(
+                    std::string_view(reinterpret_cast<const char*>(subPtr), subLen),
+                    defaultAppId, outInviteAppId, outInviteLobbyId, outHasInviteTag);
             }
         }
+    }
+
+    void SendDirectJoinLobbyChatLink(uint64 recipientSteamId, AppId_t realAppId, uint64 lobbyId,
+                                     const uint8* pHdr, uint32 cbHdr)
+    {
+        if (!g_LastSendObject || !g_SendFrameFn) return;
+        if (recipientSteamId == 0 || realAppId == 0 || realAppId == kOnlineFixAppId) return;
+        const uint64 localId = Hooks_NetPacket_RichPresence::g_LocalSteamId;
+        if (localId == 0 || recipientSteamId == localId) return;
+        if (lobbyId == 0) {
+            lobbyId = Hooks_NetPacket_Matchmaking::g_ActiveLobbyId;
+        }
+        if (lobbyId == 0) return;
+
+        static std::mutex s_dedupMutex;
+        static std::unordered_map<uint64, std::pair<uint64, uint64>> s_lastSentByRecipient;
+        const uint64 nowMs = GetTickCount64();
+        {
+            std::lock_guard<std::mutex> lock(s_dedupMutex);
+            auto it = s_lastSentByRecipient.find(recipientSteamId);
+            if (it != s_lastSentByRecipient.end() &&
+                it->second.first == lobbyId &&
+                nowMs >= it->second.second &&
+                (nowMs - it->second.second) < 2500ULL) {
+                return;
+            }
+            if (s_lastSentByRecipient.size() >= 256) {
+                s_lastSentByRecipient.clear();
+            }
+            s_lastSentByRecipient[recipientSteamId] = {lobbyId, nowMs};
+        }
+
+        CMsgProtoBufHeader hdr;
+        if (pHdr && cbHdr > 0) {
+            hdr.ParseFromArray(pHdr, cbHdr);
+        }
+        hdr.set_steamid(localId);
+        hdr.clear_routing_appid();
+        hdr.clear_jobid_source();
+        hdr.clear_jobid_target();
+        hdr.set_target_job_name("FriendMessages.SendMessage#1");
+
+        const size_t encHdrSize = hdr.ByteSizeLong();
+        if (encHdrSize == 0 || encHdrSize > kMaxHdrSize) return;
+        std::vector<uint8> hdrBytes(encHdrSize);
+        if (!hdr.SerializeToArray(hdrBytes.data(), static_cast<int>(encHdrSize))) return;
+
+        const std::string text = std::format(
+            "[url=steam://joinlobby/{}/{}/{}]steam://joinlobby/{}/{}/{}[/url]",
+            realAppId, lobbyId, localId, realAppId, lobbyId, localId);
+        std::vector<uint8> bodyBytes;
+        bodyBytes.reserve(32 + text.size());
+        bodyBytes.push_back(0x09);
+        const uint8* sidBytes = reinterpret_cast<const uint8*>(&recipientSteamId);
+        bodyBytes.insert(bodyBytes.end(), sidBytes, sidBytes + 8);
+        bodyBytes.push_back(0x10);
+        bodyBytes.push_back(0x01);
+        bodyBytes.push_back(0x1A);
+        WriteVarint(bodyBytes, text.size());
+        bodyBytes.insert(bodyBytes.end(), text.begin(), text.end());
+        bodyBytes.push_back(0x20);
+        bodyBytes.push_back(0x01);
+        bodyBytes.push_back(0x28);
+        bodyBytes.push_back(0x01);
+
+        const uint32 totalSize = static_cast<uint32>(sizeof(MsgHdr) + hdrBytes.size() + bodyBytes.size());
+        if (totalSize > sizeof(g_SendPacketPool[0])) return;
+
+        uint8* buf = g_SendPacketPool[g_SendPacketPoolIdx];
+        g_SendPacketPoolIdx = (g_SendPacketPoolIdx + 1) % kPacketPoolSize;
+        MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
+        out->eMsg = static_cast<EMsg>(static_cast<uint32>(k_EMsgServiceMethodCallFromClient) | kMsgHdrProtoFlag);
+        out->headerLength = static_cast<uint32>(hdrBytes.size());
+        memcpy(buf + sizeof(MsgHdr), hdrBytes.data(), hdrBytes.size());
+        memcpy(buf + sizeof(MsgHdr) + hdrBytes.size(), bodyBytes.data(), bodyBytes.size());
+
+        g_SendFrameFn(g_LastSendObject, k_eWebSocketOpCode_Binary, buf, totalSize);
     }
 
     bool ShouldUseOpenSteamToolInvite(const uint8* pBody, uint32 cbBody,
@@ -2515,7 +2720,19 @@ namespace {
         }
 
         if (realAppId == 0 || realAppId == kOnlineFixAppId) return false;
-        if (!ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, 1, 2)) return false;
+        if (!ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, 1, 2)) {
+            if (pBody && cbBody > 0) {
+                AppId_t inviteAppId = 0;
+                uint64 inviteLobbyId = 0;
+                bool hasInviteTag = false;
+                TrackJoinLobbyLinksInProto(pBody, cbBody, realAppId, 0, &inviteAppId, &inviteLobbyId, &hasInviteTag);
+                if (hasInviteTag) {
+                    const uint64 recipientSteamId = ExtractRecipientSteamId(pBody, cbBody, 1, 2);
+                    SendDirectJoinLobbyChatLink(recipientSteamId, realAppId, inviteLobbyId, pHdr, cbHdr);
+                }
+            }
+            return false;
+        }
 
         RewriteRoutingAppId(pHdr, cbHdr, realAppId, kOnlineFixAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
@@ -2542,16 +2759,34 @@ namespace {
         if (Hooks_Misc::IsOnlineFixActive()) return;
         if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return;
 
-        const AppId_t realAppId = ResolveRecvLuaAppId(pBody, cbBody, 1, hintAppId);
+        AppId_t realAppId = ResolveRecvLuaAppId(pBody, cbBody, 1, hintAppId);
         if (pBody && cbBody > 0) {
             uint64 senderSteamId = 0;
+            FindSteamIdField(pBody, cbBody, 1, senderSteamId);
             AppId_t senderServerAppId = realAppId;
-            if (FindSteamIdField(pBody, cbBody, 1, senderSteamId) &&
+            const bool senderUsingOst = senderSteamId != 0 &&
                 Hooks_NetPacket_RichPresence::g_FriendOstActiveBySteamId.find(senderSteamId) !=
-                    Hooks_NetPacket_RichPresence::g_FriendOstActiveBySteamId.end()) {
+                    Hooks_NetPacket_RichPresence::g_FriendOstActiveBySteamId.end();
+            if (senderUsingOst) {
                 senderServerAppId = kOnlineFixAppId;
             }
-            TrackJoinLobbyLinksInProto(pBody, cbBody, senderServerAppId);
+            AppId_t parsedInviteAppId = 0;
+            uint64 parsedInviteLobbyId = 0;
+            bool hasInviteTag = false;
+            TrackJoinLobbyLinksInProto(pBody, cbBody, senderServerAppId, 0, &parsedInviteAppId, &parsedInviteLobbyId, &hasInviteTag);
+            if (senderUsingOst && parsedInviteLobbyId != 0) {
+                Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedInviteLobbyId, kOnlineFixAppId);
+            }
+            if (realAppId == 0 && parsedInviteAppId != 0 && parsedInviteAppId != kOnlineFixAppId) {
+                realAppId = parsedInviteAppId;
+            }
+            const AppId_t targetPersonaAppId = (parsedInviteAppId != 0 && parsedInviteAppId != kOnlineFixAppId)
+                ? parsedInviteAppId
+                : realAppId;
+            if (senderSteamId != 0 && targetPersonaAppId != 0 && targetPersonaAppId != kOnlineFixAppId &&
+                (senderUsingOst || hasInviteTag || parsedInviteLobbyId != 0)) {
+                Hooks_NetPacket_RichPresence::InjectFriendPersonaAppId(senderSteamId, targetPersonaAppId, parsedInviteLobbyId);
+            }
         }
         if (realAppId == 0 || realAppId == kOnlineFixAppId) return;
 
@@ -2716,6 +2951,8 @@ namespace {
         if (!Hooks_Misc::IsOnlineFixActive()) {
             if (keepNativeMms) {
                 shouldRewriteToFake = false;
+            } else if (targetSteamIdField != 0) {
+                shouldRewriteToFake = ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, targetSteamIdField, fallbackSteamIdField);
             } else if (checkLobbyField2 && lobbyId != 0) {
                 AppId_t trackedLobbyAppId = Hooks_NetPacket_RichPresence::GetTrackedLobbyAppId(lobbyId);
                 if (trackedLobbyAppId == 0 &&
@@ -2728,8 +2965,6 @@ namespace {
                 } else {
                     shouldRewriteToFake = false;
                 }
-            } else if (targetSteamIdField != 0) {
-                shouldRewriteToFake = ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, targetSteamIdField, fallbackSteamIdField);
             }
         }
 
@@ -2751,7 +2986,19 @@ namespace {
             g_LastJoinLobbyReq.retried = false;
         }
 
-        if (!shouldRewriteToFake) return;
+        if (!shouldRewriteToFake) {
+            if (!Hooks_Misc::IsOnlineFixActive() && targetSteamIdField != 0 && pBody && cbBody > 0) {
+                const uint64 recipientSteamId = ExtractRecipientSteamId(pBody, cbBody, targetSteamIdField, fallbackSteamIdField);
+                uint64 inviteLobbyId = lobbyId;
+                if (inviteLobbyId == 0 && rewriteInviteStrings) {
+                    AppId_t parsedAppId = 0;
+                    bool hasInviteTag = false;
+                    TrackJoinLobbyLinksInProto(pBody, cbBody, realAppId, 0, &parsedAppId, &inviteLobbyId, &hasInviteTag);
+                }
+                SendDirectJoinLobbyChatLink(recipientSteamId, realAppId, inviteLobbyId, pHdr, cbHdr);
+            }
+            return;
+        }
 
         RewriteRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
@@ -2784,24 +3031,46 @@ namespace {
         if (!Hooks_NetPacket_RichPresence::BroadcastEnabled()) return;
 
         const AppId_t rawMmsAppId = ExtractRawMmsAppId(pBody, cbBody, pHdr, cbHdr);
-        if (trackLobbyField2 && pBody && cbBody > 0 && rawMmsAppId != 0) {
-            uint64 lobbyId = 0;
-            if (Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, 2, lobbyId) && lobbyId != 0) {
+        uint64 lobbyId = 0;
+        if (trackLobbyField2 && pBody && cbBody > 0) {
+            Hooks_NetPacket_Cloud::FindFixed64Field(pBody, cbBody, 2, lobbyId);
+            if (lobbyId != 0 && rawMmsAppId != 0) {
                 Hooks_NetPacket_RichPresence::TrackLobbyAppId(lobbyId, rawMmsAppId);
             }
         }
 
-        const AppId_t realAppId = ResolveRecvLuaAppId(pBody, cbBody, senderSteamIdField);
+        AppId_t realAppId = ResolveRecvLuaAppId(pBody, cbBody, senderSteamIdField);
+        if (realAppId == 0 && rawMmsAppId != 0 && rawMmsAppId != kOnlineFixAppId) {
+            realAppId = rawMmsAppId;
+        }
+        uint64 senderSteamId = 0;
+        if (senderSteamIdField != 0 && pBody && cbBody > 0) {
+            FindSteamIdField(pBody, cbBody, senderSteamIdField, senderSteamId);
+        }
         if (rewriteInviteStrings && pBody && cbBody > 0) {
-            uint64 senderSteamId = 0;
             AppId_t senderServerAppId = rawMmsAppId != 0 ? rawMmsAppId : realAppId;
-            if (senderSteamIdField != 0 &&
-                FindSteamIdField(pBody, cbBody, senderSteamIdField, senderSteamId) &&
+            const bool senderUsingOst = senderSteamId != 0 &&
                 Hooks_NetPacket_RichPresence::g_FriendOstActiveBySteamId.find(senderSteamId) !=
-                    Hooks_NetPacket_RichPresence::g_FriendOstActiveBySteamId.end()) {
+                    Hooks_NetPacket_RichPresence::g_FriendOstActiveBySteamId.end();
+            if (senderUsingOst) {
                 senderServerAppId = kOnlineFixAppId;
             }
-            TrackJoinLobbyLinksInProto(pBody, cbBody, senderServerAppId);
+            AppId_t parsedInviteAppId = 0;
+            uint64 parsedInviteLobbyId = 0;
+            bool hasInviteTag = false;
+            TrackJoinLobbyLinksInProto(pBody, cbBody, senderServerAppId, 0, &parsedInviteAppId, &parsedInviteLobbyId, &hasInviteTag);
+            if (senderUsingOst && parsedInviteLobbyId != 0) {
+                Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedInviteLobbyId, kOnlineFixAppId);
+            }
+            if (realAppId == 0 && parsedInviteAppId != 0 && parsedInviteAppId != kOnlineFixAppId) {
+                realAppId = parsedInviteAppId;
+            }
+            if (lobbyId == 0 && parsedInviteLobbyId != 0) {
+                lobbyId = parsedInviteLobbyId;
+            }
+        }
+        if (senderSteamId != 0 && realAppId != 0 && realAppId != kOnlineFixAppId) {
+            Hooks_NetPacket_RichPresence::InjectFriendPersonaAppId(senderSteamId, realAppId, lobbyId);
         }
 
         const AppId_t fakeAppId = kOnlineFixAppId;
@@ -3138,7 +3407,7 @@ namespace {
         }
 
         case k_EMsgClientMMSInviteToLobby:
-            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true, 0, false, true);
+            RewriteOnlineFixMmsOrInviteRecv(pBody, cbBody, pHdr, cbHdr, true, 3, false, true);
             return;
 
         case k_EMsgClientMMSLeaveLobbyResponse:

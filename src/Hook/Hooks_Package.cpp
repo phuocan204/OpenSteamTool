@@ -28,6 +28,9 @@ namespace {
     std::unordered_map<AppId_t, AccountID_t> g_familySharedOwners;
     std::mutex g_familySharedOwnersMutex;
 
+    std::unordered_set<AppId_t> g_knownApps;
+    std::mutex g_knownAppsMutex;
+
     // 这个 AppId 有没有出借方记录。判定自购时要用：共享游戏的 bFamilyShared
     // 在首轮就被清掉了，后面再查标记认不出来，只能靠这张表兜。
     bool HasFamilySharedOwner(AppId_t appId) {
@@ -167,8 +170,11 @@ namespace {
         //   1. 非 lua 的共享游戏，上报时把 owner 还原成出借方，避免倒计时踢线
         //   2. 判断某个 AppId 是不是家庭库里的共享游戏（lua 游戏也要记，
         //      上报时据此改写成替代 AppId，避免占用出借方名额）
-        // 只认借用标记：清掉之后 SteamId32 会被 Steam 改写，拿它做判断不可信。
-        // 记录写下后不再改动——漏记会让共享修复整体失效，宁可留着多余的。
+        if (appId != 0 && (result || (pOwn && (pOwn->bOwnsLicense || pOwn->bFamilyShared || pOwn->bBorrowed)))) {
+            std::lock_guard<std::mutex> lock(g_knownAppsMutex);
+            g_knownApps.insert(appId);
+        }
+
         if (pOwn && (pOwn->bFamilyShared || pOwn->bBorrowed) && pOwn->SteamId32 != 0) {
             bool recorded = false;
             {
@@ -270,6 +276,11 @@ namespace Hooks_Package {
         std::lock_guard<std::mutex> lock(g_familySharedOwnersMutex);
         auto it = g_familySharedOwners.find(appId);
         return it == g_familySharedOwners.end() ? 0 : it->second;
+    }
+
+    std::vector<AppId_t> GetKnownAppIds() {
+        std::lock_guard<std::mutex> lock(g_knownAppsMutex);
+        return std::vector<AppId_t>(g_knownApps.begin(), g_knownApps.end());
     }
 
     void NotifyLicenseChanged() {
