@@ -1015,6 +1015,9 @@ namespace Hooks_NetPacket_RichPresence {
     uint8   g_SelfBody[kMaxBodySize];
     uint32  g_cbSelfBody     = 0;
     bool    g_HaveSelfCached = false;
+    uint8   g_AnyPersonaHdr[kMaxHdrSize];
+    uint32  g_cbAnyPersonaHdr = 0;
+    bool    g_HaveAnyPersonaHdr = false;
 
     uint8   g_InjectPkt[kMaxPacketSize];
     uint32  g_cbInjectPkt   = 0;
@@ -1024,6 +1027,7 @@ namespace Hooks_NetPacket_RichPresence {
     std::unordered_map<uint64, AppId_t> g_FriendAppBySteamId;
     std::unordered_set<uint64> g_FriendOstActiveBySteamId;
     std::unordered_map<uint64, std::string> g_FriendGameNameBySteamId;
+    std::unordered_map<uint64, uint32> g_FriendPersonaStateBySteamId;
     std::unordered_map<uint64, CMsgClientPersonaState::Friend> g_FriendPersonaBySteamId;
     std::deque<std::vector<uint8>> g_FriendInjectQueue;
     std::mutex g_FriendInjectMutex;
@@ -1048,6 +1052,92 @@ namespace Hooks_NetPacket_RichPresence {
         std::lock_guard<std::mutex> lock(g_LobbyMapMutex);
         auto it = g_LobbyAppIdByLobbyId.find(lobbyId);
         return it != g_LobbyAppIdByLobbyId.end() ? it->second : 0;
+    }
+
+    static bool ExtractQuotedAcfValue(const std::string& line, std::string& outKey, std::string& outVal)
+    {
+        size_t q1 = line.find('"');
+        if (q1 == std::string::npos) return false;
+        size_t q2 = line.find('"', q1 + 1);
+        if (q2 == std::string::npos) return false;
+        size_t q3 = line.find('"', q2 + 1);
+        if (q3 == std::string::npos) return false;
+        size_t q4 = line.find('"', q3 + 1);
+        if (q4 == std::string::npos) return false;
+        outKey = line.substr(q1 + 1, q2 - q1 - 1);
+        outVal = line.substr(q3 + 1, q4 - q3 - 1);
+        return true;
+    }
+
+    static std::string UnescapeVdfPath(const std::string& raw)
+    {
+        std::string out;
+        out.reserve(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) {
+            if (raw[i] == '\\' && i + 1 < raw.size() && raw[i + 1] == '\\') {
+                out.push_back('\\');
+                ++i;
+            } else {
+                out.push_back(raw[i]);
+            }
+        }
+        return out;
+    }
+
+    static AppId_t FindInstalledAppIdByName(const std::string& gameName)
+    {
+        static std::unordered_map<std::string, AppId_t> s_manifestCache;
+        static ULONGLONG s_lastScanMs = 0;
+        auto cached = s_manifestCache.find(gameName);
+        if (cached != s_manifestCache.end()) return cached->second;
+
+        const ULONGLONG nowMs = GetTickCount64();
+        if (s_lastScanMs != 0 && (nowMs - s_lastScanMs) < 15000ULL) return 0;
+        s_lastScanMs = nowMs;
+
+        std::vector<std::filesystem::path> libraryRoots;
+        if (SteamInstallPath[0] != '\0') {
+            std::filesystem::path steamRoot(SteamInstallPath);
+            libraryRoots.push_back(steamRoot);
+            std::ifstream libFile(steamRoot / "config" / "libraryfolders.vdf");
+            std::string line, k, v;
+            while (std::getline(libFile, line)) {
+                if (ExtractQuotedAcfValue(line, k, v) && k == "path" && !v.empty()) {
+                    libraryRoots.emplace_back(UnescapeVdfPath(v));
+                }
+            }
+        }
+
+        std::error_code ec;
+        for (const auto& root : libraryRoots) {
+            std::filesystem::path steamapps = root / "steamapps";
+            if (!std::filesystem::is_directory(steamapps, ec)) continue;
+            for (const auto& entry : std::filesystem::directory_iterator(steamapps, ec)) {
+                if (ec) break;
+                if (!entry.is_regular_file()) continue;
+                const std::string fname = entry.path().filename().string();
+                if (fname.rfind("appmanifest_", 0) != 0 || entry.path().extension() != ".acf") continue;
+                std::ifstream acf(entry.path());
+                std::string line, k, v;
+                AppId_t parsedAppId = 0;
+                std::string parsedName;
+                while (std::getline(acf, line)) {
+                    if (!ExtractQuotedAcfValue(line, k, v)) continue;
+                    if (k == "appid" && parsedAppId == 0) {
+                        parsedAppId = static_cast<AppId_t>(std::strtoul(v.c_str(), nullptr, 10));
+                    } else if (k == "name" && parsedName.empty()) {
+                        parsedName = v;
+                    }
+                    if (parsedAppId != 0 && !parsedName.empty()) break;
+                }
+                if (parsedAppId != 0 && !parsedName.empty() && parsedAppId != kOnlineFixAppId) {
+                    s_manifestCache[parsedName] = parsedAppId;
+                }
+            }
+        }
+
+        auto after = s_manifestCache.find(gameName);
+        return after != s_manifestCache.end() ? after->second : 0;
     }
 
     static AppId_t ResolveLuaAppIdByGameName(const std::string& gameName)
@@ -1077,6 +1167,11 @@ namespace Hooks_NetPacket_RichPresence {
                 s_cache[gameName] = id;
                 return id;
             }
+        }
+        const AppId_t installedId = FindInstalledAppIdByName(gameName);
+        if (installedId != 0) {
+            s_cache[gameName] = installedId;
+            return installedId;
         }
         return 0;
     }
@@ -1369,6 +1464,12 @@ namespace Hooks_NetPacket_RichPresence {
         CMsgClientPersonaState msg;
         if (!msg.ParseFromArray(pBody, cbBody)) return false;
 
+        if (pHdr && cbHdr > 0 && cbHdr <= sizeof(g_AnyPersonaHdr)) {
+            memcpy(g_AnyPersonaHdr, pHdr, cbHdr);
+            g_cbAnyPersonaHdr = cbHdr;
+            g_HaveAnyPersonaHdr = true;
+        }
+
         CMsgClientPersonaState::Friend* selfEntry = nullptr;
         for (int i = 0; i < msg.friends_size(); ++i) {
             auto* f = msg.mutable_friends(i);
@@ -1409,7 +1510,19 @@ namespace Hooks_NetPacket_RichPresence {
         for (int i = 0; i < msg.friends_size(); ++i) {
             auto* f = msg.mutable_friends(i);
             if (!f->has_friendid() || f->friendid() == g_LocalSteamId) continue;
-            g_FriendPersonaBySteamId[f->friendid()] = *f;
+            if (f->has_persona_state() && f->persona_state() != 0) {
+                g_FriendPersonaStateBySteamId[f->friendid()] = f->persona_state();
+            }
+            {
+                auto& cached = g_FriendPersonaBySteamId[f->friendid()];
+                cached.MergeFrom(*f);
+                if ((!cached.has_persona_state() || cached.persona_state() == 0)) {
+                    auto stIt = g_FriendPersonaStateBySteamId.find(f->friendid());
+                    if (stIt != g_FriendPersonaStateBySteamId.end() && stIt->second != 0) {
+                        cached.set_persona_state(stIt->second);
+                    }
+                }
+            }
             const bool hasGameIdField = f->has_game_played_app_id() || f->has_gameid();
             const AppId_t fAppId = f->has_game_played_app_id()
                 ? f->game_played_app_id()
@@ -1481,7 +1594,18 @@ namespace Hooks_NetPacket_RichPresence {
     void InjectFriendPersonaAppId(uint64 friendSteamId, AppId_t appId, uint64 lobbyId = 0)
     {
         if (friendSteamId == 0 || appId == 0 || appId == kOnlineFixAppId || Hooks_Misc::IsOnlineFixActive()) return;
-        if (!BroadcastEnabled() || !g_HaveSelfCached) return;
+        if (!BroadcastEnabled()) return;
+        const uint8* hdrPtr = nullptr;
+        uint32 hdrSize = 0;
+        if (g_HaveSelfCached && g_cbSelfHdr > 0) {
+            hdrPtr = g_SelfHdr;
+            hdrSize = g_cbSelfHdr;
+        } else if (g_HaveAnyPersonaHdr && g_cbAnyPersonaHdr > 0) {
+            hdrPtr = g_AnyPersonaHdr;
+            hdrSize = g_cbAnyPersonaHdr;
+        } else {
+            return;
+        }
 
         g_FriendAppBySteamId[friendSteamId] = appId;
         g_LastFriendAppId = appId;
@@ -1497,8 +1621,16 @@ namespace Hooks_NetPacket_RichPresence {
             *entry = cachedIt->second;
         } else {
             entry->set_friendid(friendSteamId);
-            entry->set_persona_state(1);
         }
+        uint32 personaState = 1;
+        auto stIt = g_FriendPersonaStateBySteamId.find(friendSteamId);
+        if (stIt != g_FriendPersonaStateBySteamId.end() && stIt->second != 0) {
+            personaState = stIt->second;
+        } else if (entry->has_persona_state() && entry->persona_state() != 0) {
+            personaState = entry->persona_state();
+        }
+        entry->set_friendid(friendSteamId);
+        entry->set_persona_state(personaState);
         entry->set_game_played_app_id(appId);
         entry->set_gameid(static_cast<uint64>(appId));
         std::string name = Hooks_Misc::GetGameNameByAppID(appId);
@@ -1510,7 +1642,6 @@ namespace Hooks_NetPacket_RichPresence {
         }
         g_FriendPersonaBySteamId[friendSteamId] = *entry;
 
-        const uint32 hdrSize = g_cbSelfHdr;
         const uint32 bodySize = static_cast<uint32>(msg.ByteSizeLong());
         const uint32 total = sizeof(MsgHdr) + hdrSize + bodySize;
         if (total > kMaxPacketSize || bodySize > kMaxBodySize) return;
@@ -1520,12 +1651,34 @@ namespace Hooks_NetPacket_RichPresence {
         mhdr->eMsg = static_cast<EMsg>(
             static_cast<uint32>(k_EMsgClientPersonaState) | kMsgHdrProtoFlag);
         mhdr->headerLength = hdrSize;
-        memcpy(pkt.data() + sizeof(MsgHdr), g_SelfHdr, hdrSize);
+        memcpy(pkt.data() + sizeof(MsgHdr), hdrPtr, hdrSize);
         if (!msg.SerializeToArray(pkt.data() + sizeof(MsgHdr) + hdrSize, bodySize)) return;
 
         std::lock_guard<std::mutex> lock(g_FriendInjectMutex);
         if (g_FriendInjectQueue.size() < 32) {
             g_FriendInjectQueue.push_back(std::move(pkt));
+        }
+    }
+
+    void DrainFriendInjects(void* pThis, CNetPacket* pCarrier,
+                            bool (*invokeOriginal)(void*, CNetPacket*))
+    {
+        for (;;) {
+            std::vector<uint8> pkt;
+            {
+                std::lock_guard<std::mutex> lock(g_FriendInjectMutex);
+                if (g_FriendInjectQueue.empty()) break;
+                pkt = std::move(g_FriendInjectQueue.front());
+                g_FriendInjectQueue.pop_front();
+            }
+            if (pkt.empty()) continue;
+            uint8* origData = PktData(pCarrier);
+            uint32 origSize = PktSize(pCarrier);
+            SetPktData(pCarrier, pkt.data());
+            SetPktSize(pCarrier, static_cast<uint32>(pkt.size()));
+            invokeOriginal(pThis, pCarrier);
+            SetPktData(pCarrier, origData);
+            SetPktSize(pCarrier, origSize);
         }
     }
 
@@ -1545,23 +1698,7 @@ namespace Hooks_NetPacket_RichPresence {
             LOG_RICHPRESENCE_INFO("Delivered manufactured self-PersonaState ({} bytes)", g_cbInjectPkt);
         }
 
-        for (;;) {
-            std::vector<uint8> pkt;
-            {
-                std::lock_guard<std::mutex> lock(g_FriendInjectMutex);
-                if (g_FriendInjectQueue.empty()) break;
-                pkt = std::move(g_FriendInjectQueue.front());
-                g_FriendInjectQueue.pop_front();
-            }
-            if (pkt.empty()) continue;
-            uint8* origData = PktData(pCarrier);
-            uint32 origSize = PktSize(pCarrier);
-            SetPktData(pCarrier, pkt.data());
-            SetPktSize(pCarrier, static_cast<uint32>(pkt.size()));
-            invokeOriginal(pThis, pCarrier);
-            SetPktData(pCarrier, origData);
-            SetPktSize(pCarrier, origSize);
-        }
+        DrainFriendInjects(pThis, pCarrier, invokeOriginal);
     }
 
 } // namespace Hooks_NetPacket_RichPresence
@@ -2572,83 +2709,6 @@ namespace {
         }
     }
 
-    void SendDirectJoinLobbyChatLink(uint64 recipientSteamId, AppId_t realAppId, uint64 lobbyId,
-                                     const uint8* pHdr, uint32 cbHdr)
-    {
-        if (!g_LastSendObject || !g_SendFrameFn) return;
-        if (recipientSteamId == 0 || realAppId == 0 || realAppId == kOnlineFixAppId) return;
-        const uint64 localId = Hooks_NetPacket_RichPresence::g_LocalSteamId;
-        if (localId == 0 || recipientSteamId == localId) return;
-        if (lobbyId == 0) {
-            lobbyId = Hooks_NetPacket_Matchmaking::g_ActiveLobbyId;
-        }
-        if (lobbyId == 0) return;
-
-        static std::mutex s_dedupMutex;
-        static std::unordered_map<uint64, std::pair<uint64, uint64>> s_lastSentByRecipient;
-        const uint64 nowMs = GetTickCount64();
-        {
-            std::lock_guard<std::mutex> lock(s_dedupMutex);
-            auto it = s_lastSentByRecipient.find(recipientSteamId);
-            if (it != s_lastSentByRecipient.end() &&
-                it->second.first == lobbyId &&
-                nowMs >= it->second.second &&
-                (nowMs - it->second.second) < 2500ULL) {
-                return;
-            }
-            if (s_lastSentByRecipient.size() >= 256) {
-                s_lastSentByRecipient.clear();
-            }
-            s_lastSentByRecipient[recipientSteamId] = {lobbyId, nowMs};
-        }
-
-        CMsgProtoBufHeader hdr;
-        if (pHdr && cbHdr > 0) {
-            hdr.ParseFromArray(pHdr, cbHdr);
-        }
-        hdr.set_steamid(localId);
-        hdr.clear_routing_appid();
-        hdr.clear_jobid_source();
-        hdr.clear_jobid_target();
-        hdr.set_target_job_name("FriendMessages.SendMessage#1");
-
-        const size_t encHdrSize = hdr.ByteSizeLong();
-        if (encHdrSize == 0 || encHdrSize > kMaxHdrSize) return;
-        std::vector<uint8> hdrBytes(encHdrSize);
-        if (!hdr.SerializeToArray(hdrBytes.data(), static_cast<int>(encHdrSize))) return;
-
-        const std::string text = std::format(
-            "[url=steam://joinlobby/{}/{}/{}]steam://joinlobby/{}/{}/{}[/url]",
-            realAppId, lobbyId, localId, realAppId, lobbyId, localId);
-        std::vector<uint8> bodyBytes;
-        bodyBytes.reserve(32 + text.size());
-        bodyBytes.push_back(0x09);
-        const uint8* sidBytes = reinterpret_cast<const uint8*>(&recipientSteamId);
-        bodyBytes.insert(bodyBytes.end(), sidBytes, sidBytes + 8);
-        bodyBytes.push_back(0x10);
-        bodyBytes.push_back(0x01);
-        bodyBytes.push_back(0x1A);
-        WriteVarint(bodyBytes, text.size());
-        bodyBytes.insert(bodyBytes.end(), text.begin(), text.end());
-        bodyBytes.push_back(0x20);
-        bodyBytes.push_back(0x01);
-        bodyBytes.push_back(0x28);
-        bodyBytes.push_back(0x01);
-
-        const uint32 totalSize = static_cast<uint32>(sizeof(MsgHdr) + hdrBytes.size() + bodyBytes.size());
-        if (totalSize > sizeof(g_SendPacketPool[0])) return;
-
-        uint8* buf = g_SendPacketPool[g_SendPacketPoolIdx];
-        g_SendPacketPoolIdx = (g_SendPacketPoolIdx + 1) % kPacketPoolSize;
-        MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
-        out->eMsg = static_cast<EMsg>(static_cast<uint32>(k_EMsgServiceMethodCallFromClient) | kMsgHdrProtoFlag);
-        out->headerLength = static_cast<uint32>(hdrBytes.size());
-        memcpy(buf + sizeof(MsgHdr), hdrBytes.data(), hdrBytes.size());
-        memcpy(buf + sizeof(MsgHdr) + hdrBytes.size(), bodyBytes.data(), bodyBytes.size());
-
-        g_SendFrameFn(g_LastSendObject, k_eWebSocketOpCode_Binary, buf, totalSize);
-    }
-
     bool ShouldUseOpenSteamToolInvite(const uint8* pBody, uint32 cbBody,
                                       AppId_t realAppId,
                                       uint32 primaryField, uint32 fallbackField = 0)
@@ -2720,19 +2780,7 @@ namespace {
         }
 
         if (realAppId == 0 || realAppId == kOnlineFixAppId) return false;
-        if (!ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, 1, 2)) {
-            if (pBody && cbBody > 0) {
-                AppId_t inviteAppId = 0;
-                uint64 inviteLobbyId = 0;
-                bool hasInviteTag = false;
-                TrackJoinLobbyLinksInProto(pBody, cbBody, realAppId, 0, &inviteAppId, &inviteLobbyId, &hasInviteTag);
-                if (hasInviteTag) {
-                    const uint64 recipientSteamId = ExtractRecipientSteamId(pBody, cbBody, 1, 2);
-                    SendDirectJoinLobbyChatLink(recipientSteamId, realAppId, inviteLobbyId, pHdr, cbHdr);
-                }
-            }
-            return false;
-        }
+        if (!ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, 1, 2)) return false;
 
         RewriteRoutingAppId(pHdr, cbHdr, realAppId, kOnlineFixAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
@@ -2774,7 +2822,10 @@ namespace {
             uint64 parsedInviteLobbyId = 0;
             bool hasInviteTag = false;
             TrackJoinLobbyLinksInProto(pBody, cbBody, senderServerAppId, 0, &parsedInviteAppId, &parsedInviteLobbyId, &hasInviteTag);
-            if (senderUsingOst && parsedInviteLobbyId != 0) {
+            if (parsedInviteLobbyId != 0 &&
+                parsedInviteAppId != 0) {
+                Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedInviteLobbyId, parsedInviteAppId);
+            } else if (senderUsingOst && parsedInviteLobbyId != 0) {
                 Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedInviteLobbyId, kOnlineFixAppId);
             }
             if (realAppId == 0 && parsedInviteAppId != 0 && parsedInviteAppId != kOnlineFixAppId) {
@@ -2986,19 +3037,7 @@ namespace {
             g_LastJoinLobbyReq.retried = false;
         }
 
-        if (!shouldRewriteToFake) {
-            if (!Hooks_Misc::IsOnlineFixActive() && targetSteamIdField != 0 && pBody && cbBody > 0) {
-                const uint64 recipientSteamId = ExtractRecipientSteamId(pBody, cbBody, targetSteamIdField, fallbackSteamIdField);
-                uint64 inviteLobbyId = lobbyId;
-                if (inviteLobbyId == 0 && rewriteInviteStrings) {
-                    AppId_t parsedAppId = 0;
-                    bool hasInviteTag = false;
-                    TrackJoinLobbyLinksInProto(pBody, cbBody, realAppId, 0, &parsedAppId, &inviteLobbyId, &hasInviteTag);
-                }
-                SendDirectJoinLobbyChatLink(recipientSteamId, realAppId, inviteLobbyId, pHdr, cbHdr);
-            }
-            return;
-        }
+        if (!shouldRewriteToFake) return;
 
         RewriteRoutingAppId(pHdr, cbHdr, realAppId, fakeAppId,
                             g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
@@ -3059,7 +3098,10 @@ namespace {
             uint64 parsedInviteLobbyId = 0;
             bool hasInviteTag = false;
             TrackJoinLobbyLinksInProto(pBody, cbBody, senderServerAppId, 0, &parsedInviteAppId, &parsedInviteLobbyId, &hasInviteTag);
-            if (senderUsingOst && parsedInviteLobbyId != 0) {
+            if (parsedInviteLobbyId != 0 &&
+                parsedInviteAppId != 0) {
+                Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedInviteLobbyId, parsedInviteAppId);
+            } else if (senderUsingOst && parsedInviteLobbyId != 0) {
                 Hooks_NetPacket_RichPresence::TrackLobbyAppId(parsedInviteLobbyId, kOnlineFixAppId);
             }
             if (realAppId == 0 && parsedInviteAppId != 0 && parsedInviteAppId != kOnlineFixAppId) {
@@ -3508,7 +3550,11 @@ namespace {
         // 布局没认出来之前整个收包路径都是盲的：Drain 们借 pCarrier 指针玩的
         // 也是同一对字段。认不出就直接过原函数，一个字节都不碰。
         if (!EnsurePacketLayout(pPacket))
-            return oRecvPkt(pThis, pPacket);
+            Hooks_NetPacket_RichPresence::DrainFriendInjects(
+            pThis, pPacket,
+            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
+
+        return oRecvPkt(pThis, pPacket);
 
         Hooks_NetPacket_RichPresence::TryInject(
             pThis, pPacket,
@@ -3537,7 +3583,11 @@ namespace {
                 out->headerLength = 0;
                 SetPktData(pPacket, buf);
                 SetPktSize(pPacket, sizeof(MsgHdr));
-                return oRecvPkt(pThis, pPacket);
+                Hooks_NetPacket_RichPresence::DrainFriendInjects(
+            pThis, pPacket,
+            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
+
+        return oRecvPkt(pThis, pPacket);
             }
 
             if (g_ResizedInPlace && g_NeedReplaceHdr) {
@@ -3555,6 +3605,10 @@ namespace {
                     g_NeedReplaceBody ? g_cbNewBody : cbBody);
             }
         }
+
+        Hooks_NetPacket_RichPresence::DrainFriendInjects(
+            pThis, pPacket,
+            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
 
         return oRecvPkt(pThis, pPacket);
     }
