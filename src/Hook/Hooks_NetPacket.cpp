@@ -1765,6 +1765,9 @@ namespace Hooks_NetPacket_OnlineFix {
         const bool broadcast = Hooks_NetPacket_RichPresence::BroadcastEnabled();
 
         bool patched = false;
+        // 采用独立标记跟踪广播重写状态：480 那条已经改写过名称之后，
+        // 就不再走下面按 RichPresence 重写游戏名的分支。
+        bool didBroadcastRewrite = false;
         bool hasOnlineFixApp = false;
         for (int i = 0; i < msg.games_played_size(); ++i) {
             auto* game = msg.mutable_games_played(i);
@@ -1796,6 +1799,7 @@ namespace Hooks_NetPacket_OnlineFix {
                     if (!name.empty()) {
                         game->set_game_extra_info(name);
                         patched = true;
+                        didBroadcastRewrite = true;
                         LOG_ONLINEFIX_INFO("OnlineFix: {} -> name '{}' (real appid {})",
                             appid, name, realAppId);
                     }
@@ -1803,6 +1807,22 @@ namespace Hooks_NetPacket_OnlineFix {
             }
         }
         Hooks_Misc::OnGamesPlayedUpdated(hasOnlineFixApp);
+
+        if (broadcast && !didBroadcastRewrite) {
+            AppId_t trackedId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+            if (trackedId != 0 && trackedId != kOnlineFixAppId && !Hooks_Misc::IsOnlineFixFakeAppId(trackedId) && msg.games_played_size() > 0) {
+                std::string name = Hooks_Misc::GetGameNameByAppID(trackedId);
+                auto* topGame = msg.mutable_games_played(msg.games_played_size() - 1);
+                topGame->set_game_id(kOnlineFixAppId);
+                if (!name.empty()) {
+                    topGame->set_game_extra_info(name);
+                }
+                topGame->clear_owner_id();
+                patched = true;
+                didBroadcastRewrite = true;
+                LOG_ONLINEFIX_INFO("RichPresence: appid {} -> name '{}'", trackedId, name);
+            }
+        }
 
         for (int i = 0; i < msg.games_played_size(); ++i) {
             auto* game = msg.mutable_games_played(i);
@@ -1818,13 +1838,15 @@ namespace Hooks_NetPacket_OnlineFix {
             LOG_NETPACKET_DEBUG("FamilySharing: appid {} reported_owner={} lender_lookup={} inLua={}",
                                 playedAppId, reported, lender, inLua);
 
-            if (lender > 1) {
-                if (reported != lender) {
-                    game->set_owner_id(lender);
-                    patched = true;
-                    LOG_NETPACKET_INFO("FamilySharing: Restoring owner_id {} -> {} for game_id {}",
-                                       reported, lender, playedAppId);
+            if (lender > 1 && inLua) {
+                game->set_game_id(kFamilySharedMaskAppId);
+                if (!broadcast) {
+                    game->clear_game_extra_info();
                 }
+                game->clear_owner_id();
+                patched = true;
+                LOG_NETPACKET_INFO("FamilySharing: appid {} -> {} (shared+lua, lender {})",
+                                   playedAppId, kFamilySharedMaskAppId, lender);
                 continue;
             }
 
@@ -1833,7 +1855,15 @@ namespace Hooks_NetPacket_OnlineFix {
                     game->clear_owner_id();
                     patched = true;
                 }
+                continue;
             }
+
+            if (lender <= 1 || reported == lender) continue;
+
+            game->set_owner_id(lender);
+            patched = true;
+            LOG_NETPACKET_INFO("FamilySharing: Restoring owner_id {} -> {} for game_id {}",
+                               reported, lender, playedAppId);
         }
         if (!patched) return false;
 
@@ -2749,6 +2779,24 @@ namespace {
             g_PendingFriendMsgJobs[hdr.jobid_source()] = jobAppId;
         }
 
+        if (realAppId == 0 || realAppId == kOnlineFixAppId) return false;
+        if (!ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, 1, 2)) return false;
+
+        RewriteRoutingAppId(pHdr, cbHdr, realAppId, kOnlineFixAppId,
+                            g_SendNewHdr, g_cbSendNewHdr, g_NeedReplaceSendHdr);
+
+        if (pBody && cbBody > 0) {
+            std::vector<uint8> rewritten;
+            bool changed = false;
+            if (RewriteProtoInviteStrings(
+                    pBody, cbBody, std::to_string(realAppId), std::to_string(kOnlineFixAppId),
+                    rewritten, changed) &&
+                changed && rewritten.size() <= kMaxBodySize) {
+                memcpy(g_SendNewBody, rewritten.data(), rewritten.size());
+                g_cbSendNewBody = static_cast<uint32>(rewritten.size());
+                return true;
+            }
+        }
         return false;
     }
 
@@ -2952,8 +3000,11 @@ namespace {
 
         bool shouldRewriteToFake = true;
         if (!Hooks_Misc::IsOnlineFixActive()) {
-            shouldRewriteToFake = false;
-            if (!keepNativeMms && checkLobbyField2 && lobbyId != 0) {
+            if (keepNativeMms) {
+                shouldRewriteToFake = false;
+            } else if (targetSteamIdField != 0) {
+                shouldRewriteToFake = ShouldUseOpenSteamToolInvite(pBody, cbBody, realAppId, targetSteamIdField, fallbackSteamIdField);
+            } else if (checkLobbyField2 && lobbyId != 0) {
                 AppId_t trackedLobbyAppId = Hooks_NetPacket_RichPresence::GetTrackedLobbyAppId(lobbyId);
                 if (trackedLobbyAppId == 0 &&
                     Hooks_NetPacket_Matchmaking::g_ActiveLobbyId == lobbyId &&
@@ -2962,6 +3013,8 @@ namespace {
                 }
                 if (trackedLobbyAppId != 0) {
                     shouldRewriteToFake = (trackedLobbyAppId == fakeAppId || Hooks_Misc::IsOnlineFixFakeAppId(trackedLobbyAppId));
+                } else {
+                    shouldRewriteToFake = false;
                 }
             }
         }
