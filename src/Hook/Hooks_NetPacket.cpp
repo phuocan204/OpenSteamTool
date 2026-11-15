@@ -3550,11 +3550,7 @@ namespace {
         // 布局没认出来之前整个收包路径都是盲的：Drain 们借 pCarrier 指针玩的
         // 也是同一对字段。认不出就直接过原函数，一个字节都不碰。
         if (!EnsurePacketLayout(pPacket))
-            Hooks_NetPacket_RichPresence::DrainFriendInjects(
-            pThis, pPacket,
-            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
-
-        return oRecvPkt(pThis, pPacket);
+            return oRecvPkt(pThis, pPacket);
 
         Hooks_NetPacket_RichPresence::TryInject(
             pThis, pPacket,
@@ -3584,10 +3580,9 @@ namespace {
                 SetPktData(pPacket, buf);
                 SetPktSize(pPacket, sizeof(MsgHdr));
                 Hooks_NetPacket_RichPresence::DrainFriendInjects(
-            pThis, pPacket,
-            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
-
-        return oRecvPkt(pThis, pPacket);
+                    pThis, pPacket,
+                    [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
+                return oRecvPkt(pThis, pPacket);
             }
 
             if (g_ResizedInPlace && g_NeedReplaceHdr) {
